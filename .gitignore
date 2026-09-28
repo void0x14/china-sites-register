@@ -1,0 +1,20 @@
+# Derleme çıktıları
+/chinareg
+/bin/
+*.exe
+
+# Geçici
+*.log
+*.tmp
+/tmp/
+
+# Editör
+.vscode/
+.idea/
+*.swp
+
+# Sırlar (repoya girmez)
+.vps-bilgiler/
+*.pem
+hesaplar.txt
+patlar.txt
