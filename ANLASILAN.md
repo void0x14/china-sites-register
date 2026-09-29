@@ -42,20 +42,37 @@ Kurallar (kullanıcı emri, ağırbaş, değiştirilemez):
 gitcode için 19 mesaj var. Hangi numaraya SMS düştüğünü gösterir.
 Benzer: `/en/messages/gitee`, `/en/messages/csdn`.
 
-### KALAN SORU
-sms24 numaralarına gitcode SMS'i düşüyor (kanıtlı) ama benim denememde
-`+3584573996386`'ya düşmedi. CAPTCHA geçildi; kod isteğinin tamamlanıp
-tamamlanmadığı doğrulanıyor.
+### KALAN SORU → ÇÖZÜLDÜ
+**CAPTCHA sonrası kod isteği gönderilmiyordu.** Kanıt: CAPTCHA geçildi,
+yakalama düğümü `__gc_sms_resp` BOŞ (`capture=YOK — kod isteği hiç
+gönderilmedi`). Akış 3+ dk boşuna bekliyordu.
+Düzeltme (commit 0ba6d7f): CAPTCHA sonrası butona en fazla 4 kez basılır,
+her denemede yanıt okunur; 400018 ise hata, `result:true` ise gitti.
+
+### Yidun CAPTCHA TÜRLERİ (canlı görülen, hepsi destekli)
+1. `click in turn` — hedef ikon/karakter sırayla (subagent + gerçek tıklama)
+2. `swap 2 tiles` — 2x2 karo takası (gerçek tıklama, çözüldü)
+3. `drag the ball` — top sürükleme, engellerden kaçış (path tabanlı, eklendi)
+
+### NUMARA FORMATI (kritik)
+gitcode formu ülke bazlı UZUNLUK doğrular:
+- +48 Polonya: 10 hane → "Please enter a valid mobile number"; **9 hane kabul**
+- +358 Finlandiya: 9 hane kabul
+- +86 Çin: 11 hane
+sms24 bazı sayfalarda dahili ID'yi numara gibi listeler (HK'de 14 hane);
+ülke bazlı uzunluk filtresi eklendi.
 
 ### DÜZELTİLEN KOD
-- `internal/sites/gitcode.go` → `SupportedCCs()` artık 24 ülke (önce `["86"]`)
-- `internal/sms/sms24.go` → çok ülkeli (fi/pl/se/gb/th/hk/de/fr/it)
+- `internal/sites/gitcode.go` → `SupportedCCs()` 24 ülke; CAPTCHA sonrası
+  kod isteği yeniden gönderimi + yanıt doğrulama
+- `internal/sms/sms24.go` → çok ülkeli + uzunluk doğrulaması
+- `internal/sites/yidun.go` → `drag the ball` türü (path)
 - `cmd/chinareg/main.go` → havuz sırası: sms24 önce
 
 ## SIRADAKİ ADIM
-1. Uçtan uca koşu sonucunu al (sms24 çok ülkeli).
-2. CAPTCHA sonrası kod isteği doğrulamasını gerekiyorsa güçlendir.
-3. Başarılıysa: OAuth sırası gitcode → gitlink → jihulab (OAuth ile).
+1. Düzeltilmiş kodla koşu sonucunu al (çalışıyor).
+2. Başarılıysa: OAuth sırası gitcode → gitlink → jihulab (OAuth ile).
+3. Loop/scheduler YOK (emirler.md: yasak).
 
 ## DOSYALAR
 - Repo: `/home/void0x14/Documents/receive_sms_otomasyon`

@@ -6,6 +6,7 @@ import (
 	"html"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -152,7 +153,41 @@ func (p *Sms24) numbersFor(ctx context.Context, iso, cc string) ([]Number, error
 			Source:  "sms24",
 		})
 	}
+	// PREFIX ÖNCELİĞİ: gitcode SMS'i GERÇEK MOBİL aralıklara düşüyor.
+	// Kanıt (/en/messages/gitcode): +48 791…, +46 72…, +44 757/773/791…,
+	// +66 66…, +358 45…, +852 56…. Bu aralıklar listenin başına alınır;
+	// VoIP/ölü numaralar sona atılır (deneme sırası iyileşir).
+	if pref := sms24Prefer[cc]; len(pref) > 0 {
+		sort.SliceStable(out, func(i, j int) bool {
+			return prefixRank(out[i].Local, pref) < prefixRank(out[j].Local, pref)
+		})
+	}
 	return out, nil
+}
+
+// sms24Prefer, ülke koduna göre ÖNCELİKLİ yerel numara önekleridir.
+// Kaynak: gitcode'un SMS gönderdiği kanıtlanmış numaralar.
+var sms24Prefer = map[string][]string{
+	"48":  {"79", "78", "57", "50", "51", "53"},
+	"46":  {"72", "73", "70", "76"},
+	"44":  {"75", "77", "79", "74", "73"},
+	"358": {"45", "40", "44", "50"},
+	"852": {"5", "6", "9"},
+	"66":  {"6", "8", "9"},
+	"49":  {"15", "16", "17"},
+	"33":  {"6", "7"},
+	"39":  {"3"},
+	"86":  {"1"},
+}
+
+// prefixRank, numaranın önek sırasını döndürür (küçük = öncelikli).
+func prefixRank(local string, pref []string) int {
+	for i, p := range pref {
+		if strings.HasPrefix(local, p) {
+			return i
+		}
+	}
+	return len(pref)
 }
 
 // Messages, numaranın mesajlarını okur.
