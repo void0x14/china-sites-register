@@ -461,12 +461,26 @@ func cmdRun(args []string) error {
 	}
 
 	solverFactory := func(worker int) *captcha.Solver { return captcha.Default() }
-	pool := defaultPool()
+
+	// Havuz İŞÇİ BAŞINA kurulur: sms24 köprüsü o işçinin tarayıcısını
+	// kullanır (mesajlar yalnızca tarayıcı bağlamında okunabiliyor —
+	// canlı kanıt: "Show SMS messages" tıklamasından sonra DOM'a geliyor).
+	poolFactory := func(worker int, b *kahin.Browser) *sms.Pool {
+		bridge := flow.NewBrowserSMSBridge(b)
+		return sms.NewPool(
+			&sms.Sms24{Client: sms.NewHTTPClient(), Browser: bridge},
+			&sms.FreeSMSReceive{Client: sms.NewHTTPClient()},
+			&sms.Quackr{Client: sms.NewHTTPClient(), Browser: bridge},
+			&sms.FreePhoneNum{Client: sms.NewHTTPClient(), Countries: []string{"us", "gb", "ca", "pl", "se"}},
+			&sms.ReceiveSMSFreeCC{Client: sms.NewHTTPClient(), CountrySlugs: []string{"USA", "UK", "Sweden", "Finland"}},
+		)
+	}
 
 	rep := flow.Run(ctx, flow.Options{
 		Accounts:           accs,
 		Sites:              chosen,
-		Pool:               pool,
+		Pool:               defaultPool(),
+		PoolFactory:        poolFactory,
 		BrowserFactory:     browserFactory,
 		SolverFactory:      solverFactory,
 		PreferredCC:        *cc,

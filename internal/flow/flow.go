@@ -31,7 +31,12 @@ type Options struct {
 	Accounts []accounts.Account
 	// Sites, denenecek hedef siteler (birden çok site paralel).
 	Sites []sites.Site
-	Pool  *sms.Pool
+	// Pool, varsayılan SMS havuzu (PoolFactory yoksa kullanılır).
+	Pool *sms.Pool
+	// PoolFactory, işçi başına SMS havuzu üretir. Tarayıcı köprüsü gerektiren
+	// sağlayıcılar (sms24, quackr) o işçinin tarayıcısına bağlanmalıdır;
+	// bu yüzden havuz işçi başına kurulur. Nil ise Pool kullanılır.
+	PoolFactory func(worker int, b *kahin.Browser) *sms.Pool
 	// BrowserFactory, her işçi için ayrı Kahin tarayıcısı üretir.
 	// Paralel işçi sayısı kadar çağrılır; her biri ayrı slot/kilit kullanır.
 	BrowserFactory func(worker int) (*kahin.Browser, func(), error)
@@ -272,8 +277,17 @@ func codePrefer(site sites.Site) func(sms.Message) bool {
 func runOne(ctx context.Context, o Options, worker int, b *kahin.Browser, solver *captcha.Solver, site sites.Site, acc accounts.Account, exclude map[string]bool) *sites.Result {
 	res := &sites.Result{Site: site.Name(), Account: acc}
 
+	// SMS havuzu: işçi başına (tarayıcı köprüsü gerektiren sağlayıcılar o
+	// işçinin tarayıcısına bağlanır).
+	pool := o.Pool
+	if o.PoolFactory != nil {
+		if p := o.PoolFactory(worker, b); p != nil {
+			pool = p
+		}
+	}
+
 	// Numara: hedef formun kabul ettiği ülke kodlarından, dışlamalı.
-	acq, err := o.Pool.AcquireExcluding(ctx, o.PreferredCC, exclude, o.AllowedCCs...)
+	acq, err := pool.AcquireExcluding(ctx, o.PreferredCC, exclude, o.AllowedCCs...)
 	if acq != nil {
 		for _, a := range acq.Attempts {
 			o.Log(fmt.Sprintf("   [işçi %d] sms: %s", worker, a))
@@ -298,14 +312,14 @@ func runOne(ctx context.Context, o Options, worker int, b *kahin.Browser, solver
 	}
 
 	// SMS kodu okuyucu: mevcut mesajları "görüldü" işaretle, sonra bekle.
-	prov := findProvider(o.Pool, acq.Provider)
+	prov := findProvider(pool, acq.Provider)
 	seen := map[string]bool{}
 	seedSeen(ctx, prov, acq.Number, seen)
 	codeFn := func(cctx context.Context, n sms.Number) (string, error) {
 		// Paylaşımlı numaralarda başka servislerin SMS'leri düşer; hedef sitenin
 		// kodunu tercih et (bkz. sms.WaitForCodePref). Tercih eşleşmezse grace
 		// sonrası ilk kod yedek olarak kabul edilir.
-		code, text, err := o.Pool.WaitForCodePref(cctx, prov, n, seen, o.CodeTimeout, 8*time.Second, codePrefer(site), 90*time.Second)
+		code, text, err := pool.WaitForCodePref(cctx, prov, n, seen, o.CodeTimeout, 8*time.Second, codePrefer(site), 90*time.Second)
 		if err != nil {
 			return "", err
 		}

@@ -683,6 +683,12 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 		return fmt.Errorf("onay kutuları: %w", err)
 	}
 
+	// Gönderim ÖNCESİ tüm istekleri kaydet: reddin nedeni ancak gerçek
+	// gövdeyle kanıtlanır.
+	if err := installReqHook(b); err != nil {
+		logf("   gitcode: istek kancası kurulamadı: %v", err)
+	}
+
 	// Gönder.
 	if err := clickText(b, "Create account and continue"); err != nil {
 		return fmt.Errorf("kayıt düğmesi: %w", err)
@@ -696,6 +702,9 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 		if err == nil {
 			lastBody = info.Body
 			if msg := registerError(info.Body); msg != "" {
+				if cap := reqCapture(b); cap != "" {
+					logf("   gitcode: gönderim istekleri:\n%s", truncateOne(cap, 2500))
+				}
 				return fmt.Errorf("gitcode kayıt reddedildi: %s", msg)
 			}
 			if !strings.Contains(info.URL, "/oauth/callback") &&
@@ -704,6 +713,9 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 			}
 		}
 		time.Sleep(2 * time.Second)
+	}
+	if cap := reqCapture(b); cap != "" {
+		logf("   gitcode: gönderim istekleri (belirsiz):\n%s", truncateOne(cap, 2500))
 	}
 	return fmt.Errorf("kayıt sonucu belirsiz (son: %s | %s)", rURL(b), truncateOne(lastBody, 160))
 }
@@ -767,6 +779,65 @@ func installSMSHook(b *kahin.Browser) error {
 func smsResponse(b *kahin.Browser) string {
 	out, err := b.EvalString(`(function(){
 		var d=document.getElementById('` + smsCaptureID + `');
+		return d?d.textContent:'';
+	})()`)
+	if err != nil {
+		return ""
+	}
+	return strings.Trim(out, `"`)
+}
+
+// reqCaptureID, tüm isteklerin kaydedildiği gizli DOM düğümünün kimliğidir.
+const reqCaptureID = "__gc_reqs"
+
+// installReqHook, sayfa dünyasına TÜM XHR/fetch isteklerini kaydeden kanca
+// kurar (yöntem, url, gövde, yanıt kısa).
+//
+// NEDEN: onay kutuları görsel olarak işaretli olduğu halde form "Please read
+// and agree" ile reddediliyor. Sunucuya GİDEN gerçek gövde görülmeden hangi
+// alanın eksik olduğu bilinemez; tahmin yerine kanıt toplanır.
+func installReqHook(b *kahin.Browser) error {
+	hook := `(function(){
+		if(window.__gcReqHook){return 'already'}
+		window.__gcReqHook=1;
+		function put(line){
+			var d=document.getElementById('` + reqCaptureID + `');
+			if(!d){d=document.createElement('div');d.id='` + reqCaptureID + `';d.style.display='none';document.documentElement.appendChild(d)}
+			d.textContent=(d.textContent?d.textContent+'\n':'')+line;
+		}
+		var oOpen=XMLHttpRequest.prototype.open,oSend=XMLHttpRequest.prototype.send;
+		XMLHttpRequest.prototype.open=function(m,u){this.__gcM=m;this.__gcU=u;return oOpen.apply(this,arguments)};
+		XMLHttpRequest.prototype.send=function(body){
+			var self=this;
+			try{put('XHR '+self.__gcM+' '+self.__gcU+' BODY='+String(body).slice(0,600))}catch(e){}
+			this.addEventListener('load',function(){try{put('  RESP '+self.status+' '+String(self.responseText).slice(0,400))}catch(e){}});
+			return oSend.apply(this,arguments);
+		};
+		var of=window.fetch;
+		if(of){
+			window.fetch=function(){
+				var a=arguments;
+				try{put('FETCH '+((a[1]&&a[1].method)||'GET')+' '+(((a[0]&&a[0].url)||a[0]))+' BODY='+String((a[1]&&a[1].body)||'').slice(0,600))}catch(e){}
+				return of.apply(this,a);
+			};
+		}
+		return 'ok';
+	})()`
+	expr := "(function(){" +
+		"var s=document.createElement('script');" +
+		"s.textContent=" + jsonString(hook) + ";" +
+		"document.documentElement.appendChild(s);" +
+		"s.parentNode.removeChild(s);" +
+		"return 'ok';" +
+		"})()"
+	_, err := b.EvalString(expr)
+	return err
+}
+
+// reqCapture, istek kancasının kaydettiği gövdeyi döndürür.
+func reqCapture(b *kahin.Browser) string {
+	out, err := b.EvalString(`(function(){
+		var d=document.getElementById('` + reqCaptureID + `');
 		return d?d.textContent:'';
 	})()`)
 	if err != nil {
@@ -1141,28 +1212,42 @@ func checkAllCheckboxes(b *kahin.Browser) error {
 	// işaretsiz kutunun güncel koordinatı okunur, tıklanır, sonra durum
 	// yeniden okunur.
 	//
-	// HEDEF NOKTA: gösterge karesi (span.devui-checkbox__material) merkezi.
-	// Label merkezine tıklamak YANLIŞ: kutu 1'in etiketi iki satırdır ve
-	// merkezi satır arasına düşer; kutu 0'ın merkezi ise "User Agreement"
-	// bağlantısının üstüne düşer ve bağlantıyı açar (canlı kanıt: ekran
-	// görüntüsünde kutu 1 boş, kutu 2 işaretli; bağlantı tıklaması).
+	// DURUM SİNYALİ — KRİTİK: DevUI checkbox'ın GERÇEK durumu kök öğenin
+	// sınıfıdır: "devui-checkbox active" = işaretli, "devui-checkbox
+	// unchecked" = boş. Native input.checked ALDATICIDIR: bileşen onu hiç
+	// senkronlamaz (tıklama input'a ulaşmaz; CSS'te input z-index:-1,
+	// pointer-events:none). Kanıt:
+	//   vue-devui checkbox/style.css:
+	//     .devui-checkbox.active:not(.half-checked) .devui-checkbox__tick{opacity:1}
+	//     .devui-checkbox.active ... .devui-checkbox__material{background-size:100% 100%}
+	//     .devui-checkbox.unchecked ... .devui-checkbox__material{background-size:0% 0%}
+	//   Canlı koşu logu: tek tıklamada rootCls "unchecked" → "active" oldu;
+	//   ikinci tıklamada "active" → "unchecked" (toggle). Eski kod native
+	//   checked'i okuduğu için kutuyu iki kez tıklıyor ve geri açıyordu;
+	//   form da "Please read and agree" ile reddediyordu.
 	//
-	// DURUM SİNYALİ: tıklama sonrası gösterge/root sınıfı loglanır; karar
-	// native input.checked ile verilir ve her turda yeniden okunur.
+	// HEDEF NOKTA: gösterge karesi (span.devui-checkbox__material) merkezi.
+	// Label merkezine tıklamak YANLIŞ: kutu 1'in etiketi iki satırdır,
+	// merkezi satır arasına düşer; kutu 0'ın merkezi "User Agreement"
+	// bağlantısının üstüne düşer ve bağlantıyı açar (canlı kanıt).
 	for attempt := 0; attempt < 8; attempt++ {
 		out, err := b.EvalString(`(function(){
 			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
 			var n=boxes.length, done=0, idx=-1, cx=0, cy=0;
 			for(var i=0;i<n;i++){
 				var c=boxes[i];
-				if(c.checked){done++;continue;}
+				var lab=c.closest('label');
+				var root=lab?lab.closest('.devui-checkbox'):null;
+				// GERÇEK durum kök sınıftan okunur.
+				var isChecked=!!(root&&/(^|\s)active(\s|$)/.test(root.className));
+				if(isChecked){done++;continue;}
 				if(idx<0){
-					var lab=c.closest('label')||c;
+					var l2=lab||c;
 					// Kutuyu görünür alana getir: viewport dışı koordinata
 					// yapılan gerçek tıklama hiçbir şeye dokunmaz.
-					try{lab.scrollIntoView({block:'center'});}catch(e){}
-					var mat=lab.querySelector('.devui-checkbox__material');
-					var r=(mat||lab).getBoundingClientRect();
+					try{l2.scrollIntoView({block:'center'});}catch(e){}
+					var mat=l2.querySelector('.devui-checkbox__material');
+					var r=(mat||l2).getBoundingClientRect();
 					idx=i;
 					// Gösterge karesinin merkezi.
 					cx=r.left+r.width/2;
@@ -1188,7 +1273,32 @@ func checkAllCheckboxes(b *kahin.Browser) error {
 			return fmt.Errorf("onay kutusu yok")
 		}
 		if st.Done == st.N {
-			// Hepsi işaretli: ekran görüntüsüyle kapat.
+			// Hepsi görsel olarak işaretli. ANCAK DevUI'nin gizli native
+			// input'u hiç tıklanmaz (CSS: .devui-checkbox__input z-index:-1,
+			// pointer-events:none); bileşen yalnızca kendi görsel durumunu
+			// değiştirir. Form doğrulayıcı native input.checked okursa
+			// "Please read and agree" verir. Bu yüzden native durumu görsel
+			// duruma senkronla ve change olayını yay (kanıt: görsel ✓ ama
+			// form reddediyor).
+			if sync, err := b.EvalString(`(function(){
+				var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
+				var before=boxes.map(function(c){return c.checked});
+				boxes.forEach(function(c){
+					var lab=c.closest('label');
+					var root=lab?lab.closest('.devui-checkbox'):null;
+					var on=!!(root&&/(^|\s)active(\s|$)/.test(root.className));
+					if(c.checked!==on){
+						var d=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'checked');
+						if(d&&d.set){d.set.call(c,on)}else{c.checked=on}
+						c.dispatchEvent(new Event('input',{bubbles:true}));
+						c.dispatchEvent(new Event('change',{bubbles:true}));
+					}
+				});
+				return JSON.stringify({before:before,after:boxes.map(function(c){return c.checked})});
+			})()`); err == nil {
+				logf("   gitcode: onay native senkron: %s", truncateOne(sync, 300))
+			}
+			// Ekran görüntüsüyle kapat.
 			if shot, err := b.Screenshot(false); err == nil {
 				logf("   gitcode: onay sonrası ekran: %s", shot)
 			}
@@ -1201,18 +1311,17 @@ func checkAllCheckboxes(b *kahin.Browser) error {
 		time.Sleep(120 * time.Millisecond)
 		_ = b.MouseClick(st.X, st.Y)
 		time.Sleep(600 * time.Millisecond)
-		// Tıklama sonrası gerçek durumu oku (native + sınıflar).
+		// Tıklama sonrası kök sınıfları logla (kanıt).
 		if after, err := b.EvalString(`(function(){
 			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
 			return JSON.stringify(boxes.map(function(c){
 				var lab=c.closest('label');
 				var root=lab?lab.closest('.devui-checkbox'):null;
-				var mat=lab?lab.querySelector('.devui-checkbox__material'):null;
-				return {checked:c.checked,rootCls:root?root.className:null,matCls:mat?mat.className:null};
+				return root?root.className:'-';
 			}));
 		})()`); err == nil {
 			logf("   gitcode: onay tıklaması deneme=%d kutu=%d nokta=(%.0f,%.0f) sonrası: %s",
-				attempt, st.Idx, st.X, st.Y, truncateOne(after, 500))
+				attempt, st.Idx, st.X, st.Y, truncateOne(after, 400))
 		}
 	}
 	if shot, err := b.Screenshot(false); err == nil {
