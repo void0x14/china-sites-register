@@ -232,18 +232,21 @@ func pickNumberReason(nums []Number, cc string, exclude map[string]bool) (Number
 			pool = filtered
 		}
 	}
+	// SIRALI SEÇİM (kanıt): sağlayıcılar numaraları ÖNCELİK sırasına göre
+	// döndürür (ör. sms24 önce gitcode'un SMS gönderdiği mobil prefix'leri).
+	// Rastgele seçim bu sıralamayı bozuyordu; bu yüzden ilk uygun numara
+	// alınır — sıralama kararı sağlayıcının (sms24Prefer) kalır.
 	if len(exclude) > 0 {
-		var fresh []Number
 		for _, n := range pool {
 			if !exclude[n.E164] {
-				fresh = append(fresh, n)
+				return n, "sıralı-taze"
 			}
 		}
-		if len(fresh) > 0 {
-			return fresh[randIntn(len(fresh))], "taze"
-		}
 	}
-	return pool[randIntn(len(pool))], "rastgele"
+	if len(pool) > 0 {
+		return pool[0], "sıralı"
+	}
+	return Number{}, "yok"
 }
 
 // WaitForCode, bir numaraya gelen SMS metinlerini yoklar ve kodu çıkarır.
