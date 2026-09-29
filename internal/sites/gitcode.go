@@ -1113,17 +1113,50 @@ func clickText(b *kahin.Browser, text string) error {
 // Her kutu için: hedefin merkezi alınır, fare tıklanır, sonra checked
 // kalıcılığı yeniden okunur; kalıcı değilse tekrar denenir.
 func checkAllCheckboxes(b *kahin.Browser) error {
-	for attempt := 0; attempt < 3; attempt++ {
+	// KURAL: işlemden önce ekran görüntüsü.
+	if shot, err := b.Screenshot(false); err == nil {
+		logf("   gitcode: onay öncesi ekran: %s", shot)
+	}
+	// Teşhis (kanıt): her kutunun durumu, saran label'ın HTML'i ve
+	// viewport içi koordinatları loglanır.
+	if dump, err := b.EvalString(`(function(){
+		var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
+		return JSON.stringify({n:boxes.length,role:document.querySelectorAll('[role=checkbox]').length,
+			vp:[window.innerWidth,window.innerHeight,window.devicePixelRatio],
+			boxes:boxes.map(function(c){
+				var lab=c.closest('label');
+				var r=lab?lab.getBoundingClientRect():c.getBoundingClientRect();
+				return {checked:c.checked,cls:lab?lab.className:null,
+					rect:[Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)],
+					html:(lab||c).outerHTML.slice(0,260)};
+			})});
+	})()`); err == nil {
+		logf("   gitcode: onay kutuları: %s", truncateOne(dump, 1000))
+	}
+
+	for attempt := 0; attempt < 4; attempt++ {
 		out, err := b.EvalString(`(function(){
 			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
 			var targets=[];
 			boxes.forEach(function(c){
 				if(c.checked)return;
-				var e=c.closest('label')||c;
-				var r=e.getBoundingClientRect();
-				if(r.width>0&&r.height>0){
-					targets.push([r.left+r.width/2, r.top+r.height/2]);
-				}
+				var lab=c.closest('label')||c;
+				// Kutuyu görünür alana getir: viewport dışı koordinata yapılan
+				// gerçek tıklama HİÇBİR şeye dokunmaz (fare sınır dışında kalır).
+				try{lab.scrollIntoView({block:'center'});}catch(e){}
+				var cands=[];
+				// 1) Görsel gösterge (kare): etiket metni bir bağlantıya denk
+				// gelirse orta noktaya tıklamak bağlantıyı açar, kutuyu değil.
+				var mat=lab.querySelector('[class*=material],[class*=indicator],[class*=checkbox__box]');
+				if(mat){var rm=mat.getBoundingClientRect();
+					if(rm.width>0&&rm.height>0){cands.push([rm.left+rm.width/2,rm.top+rm.height/2]);}}
+				var rl=lab.getBoundingClientRect();
+				// 2) Etiketin SOL kenarı (gösterge buradadır), metin değil.
+				if(rl.width>0&&rl.height>0){cands.push([rl.left+8,rl.top+rl.height/2]);}
+				// 3) input'un kendisi (görünürse).
+				var ri=c.getBoundingClientRect();
+				if(ri.width>0&&ri.height>0){cands.push([ri.left+ri.width/2,ri.top+ri.height/2]);}
+				if(cands.length){targets.push(cands);}
 			});
 			return JSON.stringify({count:boxes.length,targets:targets});
 		})()`)
@@ -1134,35 +1167,52 @@ func checkAllCheckboxes(b *kahin.Browser) error {
 			return fmt.Errorf("onay kutusu yok")
 		}
 		var st struct {
-			Count   int       `json:"count"`
-			Targets [][]float64 `json:"targets"`
+			Count   int           `json:"count"`
+			Targets [][][]float64 `json:"targets"`
 		}
 		if err := json.Unmarshal([]byte(strings.Trim(out, `"`)), &st); err != nil {
 			return fmt.Errorf("onay kutusu durumu çözülemedi: %s", out)
 		}
-		// Gerçek fareyle tıkla (gerekirse aynı hedefe iki kez: Vue bazen ilk
-		// trusted tıklamayı yutar, ikincide modelValue sabitlenir).
-		for _, t := range st.Targets {
-			if len(t) != 2 {
-				continue
-			}
-			_ = b.MouseClick(t[0], t[1])
-			time.Sleep(250 * time.Millisecond)
-		}
 		if len(st.Targets) == 0 {
 			break
 		}
-		time.Sleep(800 * time.Millisecond)
+		// Gerçek fare tıklaması. Her denemede sıradaki aday nokta seçilir
+		// (gösterge → sol kenar → input); Vue bazen ilk trusted tıklamayı
+		// yutar, sonraki deneme telafi eder.
+		for _, cands := range st.Targets {
+			if len(cands) == 0 {
+				continue
+			}
+			idx := attempt
+			if idx >= len(cands) {
+				idx = len(cands) - 1
+			}
+			_ = b.MouseMove(cands[idx][0], cands[idx][1])
+			_ = b.MouseClick(cands[idx][0], cands[idx][1])
+			logf("   gitcode: onay tıklaması deneme=%d nokta=(%.0f,%.0f)", attempt, cands[idx][0], cands[idx][1])
+			time.Sleep(400 * time.Millisecond)
+		}
+		time.Sleep(700 * time.Millisecond)
 		after, err := b.EvalString(`(function(){
 			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
-			return JSON.stringify(boxes.map(function(c){return c.checked}));
+			return JSON.stringify(boxes.map(function(c){
+				var lab=c.closest('label');
+				return {checked:c.checked,cls:lab?lab.className:null};
+			}));
 		})()`)
 		if err != nil {
 			return err
 		}
-		if !strings.Contains(after, "false") {
+		logf("   gitcode: onay sonrası durum: %s", truncateOne(after, 400))
+		if !strings.Contains(after, `"checked":false`) {
+			if shot, err := b.Screenshot(false); err == nil {
+				logf("   gitcode: onay sonrası ekran: %s", shot)
+			}
 			return nil
 		}
+	}
+	if shot, err := b.Screenshot(false); err == nil {
+		logf("   gitcode: onay BAŞARISIZ ekran: %s", shot)
 	}
 	return fmt.Errorf("onay kutuları gerçek tıklamayla işaretlenemedi")
 }

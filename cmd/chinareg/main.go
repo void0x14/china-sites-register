@@ -418,9 +418,18 @@ func cmdRun(args []string) error {
 	// ayrı KAHIN_BROWSER_LOCK_PATH + KAHIN_HOME verilmezse makine geneli tek
 	// slot çakışır (engine_process_conflict). Bu yüzden işçi başına ayrı
 	// kilit/profil yolu üretilir.
+	//
+	// KAHIN_BROWSER_LOCK_PATH verilmişse onun DİZİNİ taban alınır: çağıran
+	// kendi izole slotunu (ör. /tmp/kahin-loop) seçtiğinde işçi yolları da o
+	// slotun içinde kalır. Sabit /tmp/kahin-worker-N kullanılırsa aynı anda
+	// koşan iki chinareg süreci aynı kilit dosyasına çakışır ve ikincisi
+	// engine_process_conflict alır (canlı kanıt: eşzamanlı fire).
+	base := os.TempDir()
+	if d := os.Getenv("KAHIN_BROWSER_LOCK_PATH"); d != "" {
+		base = filepath.Dir(d)
+	}
 	browserFactory := func(worker int) (*kahin.Browser, func(), error) {
 		wcfg := cfg
-		base := os.TempDir()
 		wcfg.Lock = filepath.Join(base, fmt.Sprintf("kahin-worker-%d/browser.lock", worker))
 		wcfg.Home = filepath.Join(base, fmt.Sprintf("kahin-worker-%d/home", worker))
 		wcfg.Profile = filepath.Join(base, fmt.Sprintf("kahin-worker-%d/profile", worker))
