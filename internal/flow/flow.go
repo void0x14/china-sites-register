@@ -244,6 +244,31 @@ func retryableStage(stage string) bool {
 	}
 }
 
+// codePrefer, paylaşımlı numaralarda hedef sitenin SMS'ini ayırt eder.
+//
+// free-sms-receive.com numaralarına saniyeler içinde başka servislerin
+// SMS'leri düşer (canlı kanıt: 中华万年历, 考研帮, 招商银行...). gitcode'nin
+// gönderdiği kod 中国联通/中国移动/中国电信 veya gitcode imzası taşır; bu
+// yüzden önce bu imzalar aranır.
+//
+// DİKKAT: bu bir TERCİH'tir, zorunluluk değil. Eşleşme olmazsa grace süresi
+// sonunda ilk kod yedek olarak kabul edilir (yanlış süzgeç akışı kilitlemesin).
+func codePrefer(site sites.Site) func(sms.Message) bool {
+	name := site.Name()
+	return func(m sms.Message) bool {
+		t := m.Text
+		switch name {
+		case "gitcode", "gitlink", "jihulab":
+			for _, mark := range []string{"gitcode", "GitCode", "联通", "移动", "电信", "原子", "AtomGit"} {
+				if strings.Contains(t, mark) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+}
+
 func runOne(ctx context.Context, o Options, worker int, b *kahin.Browser, solver *captcha.Solver, site sites.Site, acc accounts.Account, exclude map[string]bool) *sites.Result {
 	res := &sites.Result{Site: site.Name(), Account: acc}
 
@@ -277,7 +302,10 @@ func runOne(ctx context.Context, o Options, worker int, b *kahin.Browser, solver
 	seen := map[string]bool{}
 	seedSeen(ctx, prov, acq.Number, seen)
 	codeFn := func(cctx context.Context, n sms.Number) (string, error) {
-		code, text, err := o.Pool.WaitForCode(cctx, prov, n, seen, o.CodeTimeout, 8*time.Second)
+		// Paylaşımlı numaralarda başka servislerin SMS'leri düşer; hedef sitenin
+		// kodunu tercih et (bkz. sms.WaitForCodePref). Tercih eşleşmezse grace
+		// sonrası ilk kod yedek olarak kabul edilir.
+		code, text, err := o.Pool.WaitForCodePref(cctx, prov, n, seen, o.CodeTimeout, 8*time.Second, codePrefer(site), 90*time.Second)
 		if err != nil {
 			return "", err
 		}

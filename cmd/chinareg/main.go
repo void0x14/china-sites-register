@@ -533,12 +533,23 @@ func siteByName(name string) (sites.Site, error) {
 	return nil, fmt.Errorf("bilinmeyen site: %s (mevcut: %s)", name, strings.Join(sites.Names(), ", "))
 }
 
-// defaultPool, canlı doğrulanmış iki sağlayıcıyla havuz kurar.
+// defaultPool, canlı doğrulanmış sağlayıcılarla havuz kurar.
 //
-// Ülke listeleri gitcode'un desteklediği kodlara göre seçildi (us=1, gb=44,
-// ca=1, pl=48, se=46, fi=358); uyumsuz ülkeler zaten AllowedCCs ile süzülür.
+// ÖNCELİK: gitcode SMS ucu YALNIZCA +86 kabul eder (canlı kanıt). +86 veren
+// iki kaynak var:
+//
+//  1. free-sms-receive.com — numara listesi + mesajlar DÜZ HTTP ile okunur
+//     (canlı kanıt: 5 numara, numara başına 15 mesaj, kod regex'i eşleşiyor).
+//     Bu yüzden kod bekleyebilen TEK +86 kaynağı budur; ilk sıradadır.
+//  2. quackr — +86 numara verir ama mesaj okuma Cloudflare Turnstile ister ve
+//     tarayıcı köprüsü (QuackrBrowser) bağlı değildir; kod okunamaz.
+//     Numara kaynağı olarak yedek kalır.
+//
+// freephonenum ve receive-sms-free.cc +86 vermez (uluslararası); son çare.
 func defaultPool() *sms.Pool {
 	return sms.NewPool(
+		&sms.FreeSMSReceive{Client: sms.NewHTTPClient()},
+		&sms.Quackr{Client: sms.NewHTTPClient()},
 		&sms.FreePhoneNum{Client: sms.NewHTTPClient(), Countries: []string{"us", "gb", "ca", "pl", "se"}},
 		&sms.ReceiveSMSFreeCC{Client: sms.NewHTTPClient(), CountrySlugs: []string{"USA", "UK", "Sweden", "Finland"}},
 	)

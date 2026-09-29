@@ -76,15 +76,21 @@ func (s *GitCode) baseURL() string {
 	return "https://gitcode.com"
 }
 
-// SupportedCCs, gitcode kayıt formunun ülke kodu seçicisinde bulunan
-// ülke kodlarıdır (canlı okundu). Numara seçimi bu kümeye göre yapılmalıdır;
-// aksi halde numara formda girilemez.
+// SupportedCCs, gitcode kayıt formunun kabul ettiği ülke kodlarıdır.
+//
+// CANLI KANIT (kritik): gitcode SMS ucu (POST /api/v1/user/sms/send/codeByBiz)
+// YALNIZCA 11 haneli Çin numarası kabul eder:
+//
+//	mobile=13800138000    → {"result":true}      (gönderildi)
+//	mobile=15555151447    → {"result":true}      (gönderildi, quackr +86)
+//	mobile=+8613800138000 → 手机号格式不对        (reddedildi)
+//	mobile=+447441913503  → 手机号格式不对        (reddedildi)
+//
+// Form seçicisi başka ülkeleri gösterse de SMS GÖNDERİLMEZ. Bu yüzden
+// yalnızca "86" döndürülür; numara seçimi +86'ya kilitlenir ve boşa
+// deneme yapılmaz.
 func (s *GitCode) SupportedCCs() []string {
-	return []string{
-		"86", "852", "886", "1", "7", "33", "351", "353", "358", "39",
-		"41", "44", "46", "47", "48", "49", "54", "60", "65", "66",
-		"90", "91", "92", "972",
-	}
+	return []string{"86"}
 }
 
 // OAuthLoginURL, gitcode'un Gitee OAuth başlangıcıdır.
@@ -220,7 +226,15 @@ func (s *GitCode) GiteeLogin(b *kahin.Browser, acc accounts.Account) error {
 	if err := b.Navigate("https://gitee.com/login#lang=zh-CN", "domcontentloaded", 45*time.Second); err != nil {
 		return fmt.Errorf("gitee giriş sayfası: %w", err)
 	}
+	// Oturum zaten kuruluysa (gitee.com köküne yönlendi) giriş gerekmez.
+	if loginSucceeded(b) {
+		return nil
+	}
 	if err := ensureClassicForm(b); err != nil {
+		// Form görünmese de oturum kurulmuş olabilir (navigasyon yarışı).
+		if loginSucceeded(b) {
+			return nil
+		}
 		return err
 	}
 
@@ -576,14 +590,24 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 	}
 
 	// "Get verification code": telefon dolunca aktifleşir; aktifleşmesini bekle.
+	//
+	// Kanca ÖNCE kurulur: kod isteğinin gerçek sunucu yanıtı yalnızca bu
+	// şekilde görülür (400018 tespiti buna bağlı).
+	if err := installSMSHook(b); err != nil {
+		logf("   gitcode: SMS kancası kurulamadı: %v", err)
+	}
 	if err := clickGetCode(b); err != nil {
 		return fmt.Errorf("kod isteme düğmesi: %w", err)
 	}
 
-	// SMS gönderiminden önce NetEase Yidun CAPTCHA'sı çıkabilir (canlı
-	// doğrulandı: "Get verification code" tıklaması c.dun.163.com istekleri
-	// üretir). CAPTCHA görünürse Grok CLI ile çözülür; ancak ondan sonra SMS
-	// gönderilir.
+	// SMS gönderiminden önce CAPTCHA çıkabilir. İKİ farklı sistem canlı
+	// görüldü:
+	//
+	//  1. NetEase Yidun (.yidun_popup) — SolveYidun ile çözülür.
+	//  2. Yunpian "riddler" (window.YpRiddler) — gitcode login/kayıt akışının
+	//     ASIL sağlayıcısıdır (canlı kanıt: /uc/api/v1/user/sms/send/codeByBiz
+	//     400018 CAPTCHA_YUNPIAN_ERROR "请先通过图形验证码校验"). Yidun çözücü
+	//     bunu GÖRMEZ; aşağıdaki tespit olmadan akış sessizce 4 dk SMS bekler.
 	if waitFor(b, 6*time.Second, func() bool { return yidunVisible(b) }) == nil {
 		if s.Solver == nil {
 			return fmt.Errorf("SMS kodu için NetEase Yidun CAPTCHA çıktı, çözücü yok")
@@ -596,6 +620,42 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 		if !getCodeActive(b) {
 			_ = clickGetCode(b)
 		}
+	}
+
+	// Yunpian grafik CAPTCHA duvarı: kod isteği 400018 ile reddedilmişse
+	// sayfada doğrulama isteği görünür. Bu duvar geçilmeden SMS GİTMEZ;
+	// beklemek yerine burada dur ve aşamayı bildir.
+	if yunpianWall(b) {
+		return &YunpianCaptchaError{Detail: yunpianWallText(b)}
+	}
+
+	// SMS isteğinin GERÇEKTEN gönderildiğini doğrula ve sunucu yanıtını
+	// günlüğe yaz. Canlı doğrulanan uç: POST /api/v1/user/sms/send/codeByBiz
+	// (gövde: mobile, biz_enum, captcha_id, token, authenticate, validate).
+	// Yanıt hata içeriyorsa (ör. numara desteklenmiyor, captcha geçersiz)
+	// SMS hiç gönderilmez — bu durumu sessizce beklemek yerine bildiririz.
+	//
+	// CAPTCHA yarışı: kod isteği gönderilirken grafik doğrulama penceresi
+	// GECİKMELİ açılabilir (sunucu 400018 döner, arayüz pencereyi açar).
+	// Bu yüzden pencere kısa süre izlenir; açılırsa kod isteği reddedilmiştir.
+	for i := 0; i < 8; i++ {
+		if yunpianWall(b) {
+			return &YunpianCaptchaError{Detail: yunpianWallText(b)}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	// Kancanın yakaladığı GERÇEK sunucu yanıtı: 400018 ise SMS gitmemiştir.
+	if resp := smsResponse(b); resp != "" {
+		logf("   gitcode: SMS yanıtı: %s", truncateOne(resp, 300))
+		if strings.Contains(resp, "400018") || strings.Contains(resp, "YUNPIAN") {
+			return &YunpianCaptchaError{Detail: truncateOne(resp, 200)}
+		}
+		if strings.Contains(resp, `"error_code"`) {
+			return fmt.Errorf("gitcode SMS gönderimi reddedildi: %s", truncateOne(resp, 300))
+		}
+	}
+	if msg := smsSendError(b); msg != "" {
+		return fmt.Errorf("gitcode SMS gönderimi reddedildi: %s", msg)
 	}
 
 	// SMS kodunu bekle.
@@ -646,6 +706,134 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("kayıt sonucu belirsiz (son: %s | %s)", rURL(b), truncateOne(lastBody, 160))
+}
+
+// smsCaptureID, SMS yanıtının yazıldığı gizli DOM düğümünün kimliğidir.
+const smsCaptureID = "__gc_sms_resp"
+
+// installSMSHook, sayfa dünyasına XHR/fetch kancası kurar.
+//
+// NEDEN: kod isteğinin GERÇEK sunucu yanıtı (POST /api/v1/user/sms/send/codeByBiz)
+// görülmeden "SMS gelmedi" denemez. Canlı kanıt: grafik doğrulama yapılmadan
+// istek atılırsa sunucu 400018 CAPTCHA_YUNPIAN_ERROR döner ve HİÇBİR numaraya
+// SMS gitmez; bu yanıt görülmezse akış boşuna 4 dk bekler (run 2, run 3).
+//
+// Kahin eval'i izole master world'de çalışır ve sayfa-world global'lerini
+// GÖREMEZ. Bu yüzden kanca, <script> düğümüyle SAYFA dünyasına enjekte edilir;
+// yanıt da sayfa-world global'i yerine DOM'a (gizli div) yazılır — DOM iki
+// dünyadan da okunur.
+func installSMSHook(b *kahin.Browser) error {
+	hook := `(function(){
+		if(window.__gcSmsHook){return 'already'}
+		window.__gcSmsHook=1;
+		function put(t){
+			var d=document.getElementById('` + smsCaptureID + `');
+			if(!d){d=document.createElement('div');d.id='` + smsCaptureID + `';d.style.display='none';document.documentElement.appendChild(d)}
+			d.textContent=String(t).slice(0,1200);
+		}
+		function rec(u,body){try{if(String(u).indexOf('codeByBiz')>=0){put(body)}}catch(e){}}
+		var oOpen=XMLHttpRequest.prototype.open,oSend=XMLHttpRequest.prototype.send;
+		XMLHttpRequest.prototype.open=function(m,u){this.__gcUrl=u;return oOpen.apply(this,arguments)};
+		XMLHttpRequest.prototype.send=function(){
+			var self=this;
+			this.addEventListener('load',function(){rec(self.__gcUrl,self.responseText)});
+			return oSend.apply(this,arguments);
+		};
+		var of=window.fetch;
+		if(of){
+			window.fetch=function(){
+				var a=arguments;
+				return of.apply(this,a).then(function(r){
+					try{r.clone().text().then(function(t){rec((a[0]&&a[0].url)||a[0],t)})}catch(e){}
+					return r;
+				});
+			};
+		}
+		return 'ok';
+	})()`
+	// <script> içeriği sayfa dünyasında çalışır (izole dünyadan DOM'a eklenir).
+	expr := "(function(){" +
+		"var s=document.createElement('script');" +
+		"s.textContent=" + jsonString(hook) + ";" +
+		"document.documentElement.appendChild(s);" +
+		"s.parentNode.removeChild(s);" +
+		"return 'ok';" +
+		"})()"
+	_, err := b.EvalString(expr)
+	return err
+}
+
+// smsResponse, kancanın yakaladığı son codeByBiz yanıtını döndürür.
+func smsResponse(b *kahin.Browser) string {
+	out, err := b.EvalString(`(function(){
+		var d=document.getElementById('` + smsCaptureID + `');
+		return d?d.textContent:'';
+	})()`)
+	if err != nil {
+		return ""
+	}
+	return strings.Trim(out, `"`)
+}
+
+// jsonString, bir metni JS string literal'ine çevirir (kaçışlı).
+func jsonString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(b)
+}
+
+// yunpianWall, Yunpian grafik CAPTCHA'sının sayfada göründüğünü söyler.
+//
+// CANLI DOĞRULANAN MEKANİK: gitcode, SMS kodu isteğini
+// POST /uc/api/v1/user/sms/send/codeByBiz ile yapar; grafik doğrulama
+// yapılmadan çağrılırsa sunucu
+//
+//	{"error_code":400018,"error_message":"CAPTCHA_YUNPIAN_ERROR",
+//	 "error_description":"请先通过图形验证码校验"}
+//
+// döner (canlı kanıt). Arayüz bu durumda YpRiddler SDK'sıyla bir grafik
+// doğrulama penceresi açar. YpRiddler "flat" modda kendi kutusunu
+// .yp-riddler-winbox içine kurar; doğrulama bitene kadar ekranda kalır.
+//
+// Bu duvar geçilmeden HİÇBİR numaraya SMS gitmez; bu yüzden beklemek
+// yerine erken durulur.
+func yunpianWall(b *kahin.Browser) bool {
+	return evalBool(b, `(function(){
+		if(!window.YpRiddler)return false;
+		var w=document.querySelector('.yp-riddler-winbox');
+		if(!w)return false;
+		var r=w.getBoundingClientRect();
+		return r.width>0&&r.height>0&&getComputedStyle(w).display!=='none';
+	})()`)
+}
+
+// yunpianWallText, Yunpian duvarındaki görev metnini döndürür (teşhis için).
+func yunpianWallText(b *kahin.Browser) string {
+	out, err := b.EvalString(`(function(){
+		var t=document.querySelector('.yp-riddler-slider-tip-default,.yp-riddler-tip-text-container span,.yp-riddler-result');
+		if(!t)return 'grafik doğrulama açık';
+		return (t.innerText||'').trim().slice(0,80);
+	})()`)
+	if err != nil {
+		return "grafik doğrulama açık"
+	}
+	return strings.Trim(out, `"`)
+}
+
+// YunpianCaptchaError, gitcode SMS kodunun Yunpian grafik CAPTCHA'sı ile
+// bloklandığını bildirir.
+//
+// Bu durum NUMARADAN bağımsızdır: numara değiştirmek sonuç vermez, yalnızca
+// CAPTCHA geçilirse kod isteği gönderilir. Bu yüzden ayrı bir hata türüdür ve
+// akış katmanı bunu "yeniden denenebilir" saymaz.
+type YunpianCaptchaError struct {
+	Detail string
+}
+
+func (e *YunpianCaptchaError) Error() string {
+	return "gitcode SMS kodu Yunpian grafik CAPTCHA ile bloklandı: " + e.Detail
 }
 
 // registerError, kayıt formundaki bilinen hata metinlerini arar.
@@ -790,6 +978,48 @@ func getCodeActive(b *kahin.Browser) bool {
 	})()`)
 }
 
+// smsSendError, sayfada son SMS gönderim yanıtının hata mesajını arar.
+//
+// gitcode SMS ucu: POST /api/v1/user/sms/send/codeByBiz. Yanıt kodu
+// başarısızsa arayüz bir hata gösterir; burada o hata metni aranır.
+//
+// CANLI KANIT (400018): grafik doğrulama yapılmadan kod istenirse sunucu
+//
+//	{"error_code":400018,"error_message":"CAPTCHA_YUNPIAN_ERROR",
+//	 "error_description":"请先通过图形验证码校验"}
+//
+// döner. Bu metin yakalanmazsa akış "SMS gelmedi" sanıp boşuna bekler.
+func smsSendError(b *kahin.Browser) string {
+	out, err := b.EvalString(`(function(){
+		var t=(document.body?document.body.innerText:'');
+		var marks=['发送失败','发送过于频繁','手机号','验证码错误','验证失败','请先完成验证','请先通过图形验证码校验',
+			'不支持','频繁','too frequent','failed to send','invalid','not supported'];
+		for(var i=0;i<marks.length;i++){
+			if(t.indexOf(marks[i])>=0){
+				var idx=t.indexOf(marks[i]);
+				return t.slice(Math.max(0,idx-30), idx+50);
+			}
+		}
+		return '';
+	})()`)
+	if err != nil {
+		return ""
+	}
+	s := strings.Trim(out, `"`)
+	// Sayfa genelindeki "验证码" etiketi (alan adı) yanlış pozitif üretmesin:
+	// yalnızca hata işareti + kısa bağlam varsa döndür.
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "发送失败") || strings.Contains(s, "发送过于频繁") ||
+		strings.Contains(s, "请先完成验证") || strings.Contains(s, "不支持") ||
+		strings.Contains(s, "请先通过图形验证码校验") ||
+		strings.Contains(s, "too frequent") || strings.Contains(s, "failed to send") {
+		return s
+	}
+	return ""
+}
+
 // clickGetCode, "Get verification code" düğmesine basar.
 //
 // Düğme telefon geçerli dolana kadar pasiftir (not-allowed); aktifleşmesini
@@ -870,29 +1100,71 @@ func clickText(b *kahin.Browser, text string) error {
 
 // checkAllCheckboxes, sayfadaki tüm onay kutularını işaretler ve doğrular.
 //
-// Onay kutuları görünmez input'lardır (0x0, opacity 0). Programatik .click()
-// devui'nin change olayını tetikler ve checked=true olur; bu canlı doğrulandı.
-// İşaretleme sonrası her kutunun checked olduğu kontrol edilir.
+// CANLI DOĞRULANAN MEKANİK (kritik, bu oturum): gitcode onay kutuları Vue
+// bileşenidir (DCheckbox): div.devui-checkbox > div > label > input[type=checkbox].
+// Ne input.click() ne de label.click() (JS'ten) işe yarar: ikisi de
+// "untrusted" olaydır, DCheckbox'ın onClick'i yalnızca stopPropagation
+// çağırır, Vue modelValue'su güncellenmez. DOM checked=true görünür ama form
+// "Please read and agree" ile reddedilir (canlı kanıt: run 1-4).
+//
+// Doğru yol: GERÇEK fare tıklaması (kahin_mirage_mouse_click → CDP
+// Input.dispatchMouseEvent, trusted). Kahin'in kendi kahin_mirage_click
+// yolu da gerçek tıklamadır; bu yüzden doğrudan koordinatla tıklanır.
+// Her kutu için: hedefin merkezi alınır, fare tıklanır, sonra checked
+// kalıcılığı yeniden okunur; kalıcı değilse tekrar denenir.
 func checkAllCheckboxes(b *kahin.Browser) error {
-	out, err := b.EvalString(`(function(){
-		var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
-		var n=0;
-		boxes.forEach(function(c){ if(!c.checked){ c.click(); n++; } });
-		return JSON.stringify({count:boxes.length,clicked:n,checked:boxes.map(function(c){return c.checked})});
-	})()`)
-	if err != nil {
-		return err
+	for attempt := 0; attempt < 3; attempt++ {
+		out, err := b.EvalString(`(function(){
+			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
+			var targets=[];
+			boxes.forEach(function(c){
+				if(c.checked)return;
+				var e=c.closest('label')||c;
+				var r=e.getBoundingClientRect();
+				if(r.width>0&&r.height>0){
+					targets.push([r.left+r.width/2, r.top+r.height/2]);
+				}
+			});
+			return JSON.stringify({count:boxes.length,targets:targets});
+		})()`)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(out, `"count":0`) {
+			return fmt.Errorf("onay kutusu yok")
+		}
+		var st struct {
+			Count   int       `json:"count"`
+			Targets [][]float64 `json:"targets"`
+		}
+		if err := json.Unmarshal([]byte(strings.Trim(out, `"`)), &st); err != nil {
+			return fmt.Errorf("onay kutusu durumu çözülemedi: %s", out)
+		}
+		// Gerçek fareyle tıkla (gerekirse aynı hedefe iki kez: Vue bazen ilk
+		// trusted tıklamayı yutar, ikincide modelValue sabitlenir).
+		for _, t := range st.Targets {
+			if len(t) != 2 {
+				continue
+			}
+			_ = b.MouseClick(t[0], t[1])
+			time.Sleep(250 * time.Millisecond)
+		}
+		if len(st.Targets) == 0 {
+			break
+		}
+		time.Sleep(800 * time.Millisecond)
+		after, err := b.EvalString(`(function(){
+			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
+			return JSON.stringify(boxes.map(function(c){return c.checked}));
+		})()`)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(after, "false") {
+			return nil
+		}
 	}
-	if strings.Contains(out, `"count":0`) {
-		return fmt.Errorf("onay kutusu yok")
-	}
-	if !strings.Contains(out, "true") {
-		return fmt.Errorf("onay kutuları işaretlenemedi: %s", out)
-	}
-	if strings.Contains(out, "false") {
-		return fmt.Errorf("bazı onay kutuları işaretsiz kaldı: %s", out)
-	}
-	return nil
+	return fmt.Errorf("onay kutuları gerçek tıklamayla işaretlenemedi")
 }
 
 func rURL(b *kahin.Browser) string {

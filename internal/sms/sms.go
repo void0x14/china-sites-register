@@ -251,17 +251,36 @@ func pickNumberReason(nums []Number, cc string, exclude map[string]bool) (Number
 // Döngü: her interval'da sağlayıcıdan mesajlar okunur, seen'de olmayan yeni
 // mesajlarda kod regex'i aranır. Bulunan ilk kod döner.
 func (p *Pool) WaitForCode(ctx context.Context, prov Provider, n Number, seen map[string]bool, timeout, interval time.Duration) (string, string, error) {
+	return p.WaitForCodePref(ctx, prov, n, seen, timeout, interval, nil, 0)
+}
+
+// WaitForCodePref, gelen kodda "tercih" süzgeci uygulayarak kodu okur.
+//
+// NEDEN GEREKLİ (canlı kanıt): free-sms-receive.com numaraları PAYLAŞIMLIDIR;
+// numaraya saniyeler içinde BAŞKA servislerin SMS'leri düşer (ör. "中华万年历
+// 验证码：317845", "考研帮 登录验证码：89928"). Düz "ilk kodu al" mantığı
+// bunları hedef sitenin kodu sanar ve kayıt yanlış kodla reddedilir.
+//
+// Kural: prefer(m) true olan mesajın kodu hemen kabul edilir. Hiç tercih
+// eşleşmezse, grace süresi dolduktan sonra ilk kod yedek olarak kabul edilir
+// (tercih süzgeci yanlış yazılmışsa akış tümden kilitlenmesin).
+func (p *Pool) WaitForCodePref(ctx context.Context, prov Provider, n Number, seen map[string]bool, timeout, interval time.Duration, prefer func(Message) bool, grace time.Duration) (string, string, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
 	if interval <= 0 {
 		interval = 8 * time.Second
 	}
+	if grace <= 0 {
+		grace = 60 * time.Second
+	}
 	if seen == nil {
 		seen = map[string]bool{}
 	}
 	deadline := time.Now().Add(timeout)
+	graceUntil := time.Now().Add(grace)
 	var lastErr error
+	var fallbackCode, fallbackText string
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -280,9 +299,20 @@ func (p *Pool) WaitForCode(ctx context.Context, prov Provider, n Number, seen ma
 					continue
 				}
 				seen[key] = true
-				if code := ExtractCode(m.Text); code != "" {
+				code := ExtractCode(m.Text)
+				if code == "" {
+					continue
+				}
+				if prefer == nil || prefer(m) {
 					return code, m.Text, nil
 				}
+				if fallbackCode == "" {
+					fallbackCode, fallbackText = code, m.Text
+				}
+			}
+			// Tercih eşleşmedi ama yedek kod var: grace dolduysa yedeği kullan.
+			if fallbackCode != "" && time.Now().After(graceUntil) {
+				return fallbackCode, fallbackText, nil
 			}
 		}
 		select {
