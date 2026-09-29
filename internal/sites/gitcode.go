@@ -1121,109 +1121,98 @@ func checkAllCheckboxes(b *kahin.Browser) error {
 	// viewport içi koordinatları loglanır.
 	if dump, err := b.EvalString(`(function(){
 		var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
-		return JSON.stringify({n:boxes.length,role:document.querySelectorAll('[role=checkbox]').length,
+		return JSON.stringify({n:boxes.length,
 			vp:[window.innerWidth,window.innerHeight,window.devicePixelRatio],
 			boxes:boxes.map(function(c){
 				var lab=c.closest('label');
+				var root=lab?lab.closest('.devui-checkbox'):null;
+				var mat=lab?lab.querySelector('.devui-checkbox__material'):null;
 				var r=lab?lab.getBoundingClientRect():c.getBoundingClientRect();
-				return {checked:c.checked,cls:lab?lab.className:null,
-					rect:[Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)],
-					html:(lab||c).outerHTML.slice(0,260)};
+				return {checked:c.checked,labCls:lab?lab.className:null,
+					rootCls:root?root.className:null,matCls:mat?mat.className:null,
+					rect:[Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)]};
 			})});
 	})()`); err == nil {
-		logf("   gitcode: onay kutuları: %s", truncateOne(dump, 1000))
+		logf("   gitcode: onay kutuları: %s", truncateOne(dump, 1200))
 	}
 
-	for attempt := 0; attempt < 4; attempt++ {
+	// TEK TEK ilerle: bir kutuya tıklandığında sayfa yeniden render edilir ve
+	// sonraki kutunun koordinatı KAYAR. Bu yüzden her turda yalnızca İLK
+	// işaretsiz kutunun güncel koordinatı okunur, tıklanır, sonra durum
+	// yeniden okunur.
+	//
+	// HEDEF NOKTA: gösterge karesi (span.devui-checkbox__material) merkezi.
+	// Label merkezine tıklamak YANLIŞ: kutu 1'in etiketi iki satırdır ve
+	// merkezi satır arasına düşer; kutu 0'ın merkezi ise "User Agreement"
+	// bağlantısının üstüne düşer ve bağlantıyı açar (canlı kanıt: ekran
+	// görüntüsünde kutu 1 boş, kutu 2 işaretli; bağlantı tıklaması).
+	//
+	// DURUM SİNYALİ: tıklama sonrası gösterge/root sınıfı loglanır; karar
+	// native input.checked ile verilir ve her turda yeniden okunur.
+	for attempt := 0; attempt < 8; attempt++ {
 		out, err := b.EvalString(`(function(){
 			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
-			var targets=[];
-			boxes.forEach(function(c){
-				var lab0=c.closest('label');
-				// GERÇEK SİNYAL DevUI sınıfıdır: native input.checked true olsa
-				// bile bileşen unchecked olabilir (canlı kanıt). Bu yüzden
-				// "işaretli" kararı sınıfa göre verilir.
-				var devChecked=!!(lab0&&String(lab0.className).indexOf('devui-checkbox__checked')>=0);
-				if(devChecked)return;
-				var lab=lab0||c;
-				// Kutuyu görünür alana getir: viewport dışı koordinata yapılan
-				// gerçek tıklama HİÇBİR şeye dokunmaz (fare sınır dışında kalır).
-				try{lab.scrollIntoView({block:'center'});}catch(e){}
-				var cands=[];
-				// 1) Görsel gösterge (kare): etiket metni bir bağlantıya denk
-				// gelirse orta noktaya tıklamak bağlantıyı açar, kutuyu değil.
-				var mat=lab.querySelector('[class*=material],[class*=indicator],[class*=checkbox__box]');
-				if(mat){var rm=mat.getBoundingClientRect();
-					if(rm.width>0&&rm.height>0){cands.push([rm.left+rm.width/2,rm.top+rm.height/2]);}}
-				var rl=lab.getBoundingClientRect();
-				// 2) Etiketin SOL kenarı (gösterge buradadır), metin değil.
-				if(rl.width>0&&rl.height>0){cands.push([rl.left+8,rl.top+rl.height/2]);}
-				// 3) input'un kendisi (görünürse).
-				var ri=c.getBoundingClientRect();
-				if(ri.width>0&&ri.height>0){cands.push([ri.left+ri.width/2,ri.top+ri.height/2]);}
-				// 4) LABEL'ın TAM MERKEZİ — kanıtlanmış nokta (son eleman
-				// olarak eklenir; kod bunu seçer).
-				if(rl.width>0&&rl.height>0){cands.push([rl.left+rl.width/2,rl.top+rl.height/2]);}
-				if(cands.length){targets.push(cands);}
-			});
-			return JSON.stringify({count:boxes.length,targets:targets});
+			var n=boxes.length, done=0, idx=-1, cx=0, cy=0;
+			for(var i=0;i<n;i++){
+				var c=boxes[i];
+				if(c.checked){done++;continue;}
+				if(idx<0){
+					var lab=c.closest('label')||c;
+					// Kutuyu görünür alana getir: viewport dışı koordinata
+					// yapılan gerçek tıklama hiçbir şeye dokunmaz.
+					try{lab.scrollIntoView({block:'center'});}catch(e){}
+					var mat=lab.querySelector('.devui-checkbox__material');
+					var r=(mat||lab).getBoundingClientRect();
+					idx=i;
+					// Gösterge karesinin merkezi.
+					cx=r.left+r.width/2;
+					cy=r.top+r.height/2;
+				}
+			}
+			return JSON.stringify({n:n,done:done,idx:idx,x:cx,y:cy});
 		})()`)
 		if err != nil {
 			return err
 		}
-		if strings.Contains(out, `"count":0`) {
-			return fmt.Errorf("onay kutusu yok")
-		}
 		var st struct {
-			Count   int           `json:"count"`
-			Targets [][][]float64 `json:"targets"`
+			N    int     `json:"n"`
+			Done int     `json:"done"`
+			Idx  int     `json:"idx"`
+			X    float64 `json:"x"`
+			Y    float64 `json:"y"`
 		}
 		if err := json.Unmarshal([]byte(strings.Trim(out, `"`)), &st); err != nil {
 			return fmt.Errorf("onay kutusu durumu çözülemedi: %s", out)
 		}
-		if len(st.Targets) == 0 {
-			break
+		if st.N == 0 {
+			return fmt.Errorf("onay kutusu yok")
 		}
-		// CANLI KANIT (bu oturum, elle doğrulandı): işaretlenen nokta,
-		// LABEL'ın MERKEZİDİR. Gösterge (span.devui-checkbox__material)
-		// merkezine ya da sol kenara yapılan tıklama DevUI'nin Vue
-		// modelValue'sunu güncellemiyor; label merkezine yapılan gerçek
-		// tıklama iki kutuyu da işaretledi (ekran görüntüsü: iki mavi ✓).
-		//
-		// GERÇEK SİNYAL: label.className içinde "devui-checkbox__checked".
-		// native input.checked aldatıcıdır (true olur ama bileşen durumu
-		// değişmez, form yine reddeder) — o yüzden sınıf kontrol edilir.
-		for _, cands := range st.Targets {
-			if len(cands) == 0 {
-				continue
-			}
-			// Adayların son elemanı label merkezidir (kanıtlanmış nokta).
-			p := cands[len(cands)-1]
-			_ = b.MouseMove(p[0], p[1])
-			time.Sleep(120 * time.Millisecond)
-			_ = b.MouseClick(p[0], p[1])
-			logf("   gitcode: onay tıklaması deneme=%d nokta=(%.0f,%.0f)", attempt, p[0], p[1])
-			time.Sleep(500 * time.Millisecond)
-		}
-		time.Sleep(700 * time.Millisecond)
-		after, err := b.EvalString(`(function(){
-			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
-			return JSON.stringify(boxes.map(function(c){
-				var lab=c.closest('label');
-				return {checked:c.checked,cls:lab?lab.className:null,
-					devChecked:!!(lab&&String(lab.className).indexOf('devui-checkbox__checked')>=0)};
-			}));
-		})()`)
-		if err != nil {
-			return err
-		}
-		logf("   gitcode: onay sonrası durum: %s", truncateOne(after, 400))
-		// Başarı ölçütü: her kutunun DevUI sınıfı checked olmalı.
-		if !strings.Contains(after, `"devChecked":false`) {
+		if st.Done == st.N {
+			// Hepsi işaretli: ekran görüntüsüyle kapat.
 			if shot, err := b.Screenshot(false); err == nil {
 				logf("   gitcode: onay sonrası ekran: %s", shot)
 			}
 			return nil
+		}
+		if st.Idx < 0 || (st.X == 0 && st.Y == 0) {
+			return fmt.Errorf("işaretsiz onay kutusunun koordinatı okunamadı")
+		}
+		_ = b.MouseMove(st.X, st.Y)
+		time.Sleep(120 * time.Millisecond)
+		_ = b.MouseClick(st.X, st.Y)
+		time.Sleep(600 * time.Millisecond)
+		// Tıklama sonrası gerçek durumu oku (native + sınıflar).
+		if after, err := b.EvalString(`(function(){
+			var boxes=Array.from(document.querySelectorAll('input[type=checkbox]'));
+			return JSON.stringify(boxes.map(function(c){
+				var lab=c.closest('label');
+				var root=lab?lab.closest('.devui-checkbox'):null;
+				var mat=lab?lab.querySelector('.devui-checkbox__material'):null;
+				return {checked:c.checked,rootCls:root?root.className:null,matCls:mat?mat.className:null};
+			}));
+		})()`); err == nil {
+			logf("   gitcode: onay tıklaması deneme=%d kutu=%d nokta=(%.0f,%.0f) sonrası: %s",
+				attempt, st.Idx, st.X, st.Y, truncateOne(after, 500))
 		}
 	}
 	if shot, err := b.Screenshot(false); err == nil {
