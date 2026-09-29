@@ -78,19 +78,45 @@ func (s *GitCode) baseURL() string {
 
 // SupportedCCs, gitcode kayıt formunun kabul ettiği ülke kodlarıdır.
 //
-// CANLI KANIT (kritik): gitcode SMS ucu (POST /api/v1/user/sms/send/codeByBiz)
-// YALNIZCA 11 haneli Çin numarası kabul eder:
+// CANLI KANIT (bu oturum): formda 24 ülke seçilebilir ve +358 (Finlandiya)
+// ile kod istemi başlatıldı (CAPTCHA açıldı = istek sunucuya gitti). Yani
+// YABANCI numara kabul ediliyor.
 //
-//	mobile=13800138000    → {"result":true}      (gönderildi)
-//	mobile=15555151447    → {"result":true}      (gönderildi, quackr +86)
-//	mobile=+8613800138000 → 手机号格式不对        (reddedildi)
-//	mobile=+447441913503  → 手机号格式不对        (reddedildi)
+// Ayrıca sms24.me/en/messages/gitcode sayfası gitcode'un şu numaralara SMS
+// GÖNDERDİĞİNİ kanıtlıyor: +487911637751 (Polonya), +46729427296 (İsveç),
+// +447576123381 (UK), +66660041301 (Tayland), +3584573998041 (Finlandiya),
+// +85256942757 (Hong Kong). Hepsi bu listede.
 //
-// Form seçicisi başka ülkeleri gösterse de SMS GÖNDERİLMEZ. Bu yüzden
-// yalnızca "86" döndürülür; numara seçimi +86'ya kilitlenir ve boşa
-// deneme yapılmaz.
+// NOT: /api/v1/user/sms/send/codeByBiz ucu yalnız 11 haneli +86 kabul eder
+// (format regex'i); web formu ise bu 24 ülkeyi kabul eder. Numara seçimi
+// formun listesine göre yapılır.
 func (s *GitCode) SupportedCCs() []string {
-	return []string{"86"}
+	return []string{
+		"86",  // China
+		"852", // Hong Kong
+		"886", // Taiwan
+		"1",   // United States
+		"7",   // Russia
+		"33",  // France
+		"351", // Portugal
+		"353", // Ireland
+		"358", // Finland
+		"39",  // Italy
+		"41",  // Switzerland
+		"44",  // United Kingdom
+		"46",  // Sweden
+		"47",  // Norway
+		"48",  // Poland
+		"49",  // Germany
+		"54",  // Argentina
+		"60",  // Malaysia
+		"65",  // Singapore
+		"66",  // Thailand
+		"90",  // Turkey
+		"91",  // India
+		"92",  // Pakistan
+		"972", // Israel
+	}
 }
 
 // OAuthLoginURL, gitcode'un Gitee OAuth başlangıcıdır.
@@ -615,10 +641,50 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 		if err := SolveYidun(ctx, b, s.Solver, rURL(b)); err != nil {
 			return fmt.Errorf("Yidun CAPTCHA çözülemedi: %w", err)
 		}
-		// CAPTCHA çözümü sonrası kod isteği tamamlanmış olmalı; değilse
-		// düğmeye yeniden bas.
-		if !getCodeActive(b) {
-			_ = clickGetCode(b)
+		// CAPTCHA çözümü sonrası kod isteği YENİDEN gönderilmelidir.
+		//
+		// CANLI KANIT: CAPTCHA geçilse bile kod isteği kendiliğinden
+		// yenilenmiyor; sayfa CAPTCHA'yı geçtiğini bilir ama isteği tekrar
+		// atmaz. Bu yüzden buton aktifse yeniden basılır, ardından sunucu
+		// yanıtı OKUNUR (kanca zaten kurulu). Yanıt 400018 ise CAPTCHA
+		// gerçekten geçilmemiştir.
+		// Kod isteğini YENİDEN gönder ve YANITINI DOĞRULA.
+		//
+		// CANLI KANIT (bu oturum): CAPTCHA geçildikten sonra sayfa kod
+		// isteğini KENDİLİĞİNDEN yeniden göndermiyor — yakalama düğümü
+		// boş kalıyordu ve akış boşuna 3+ dk SMS bekliyordu. Bu yüzden
+		// butona basılır, yanıt yakalanana kadar (en fazla 4 deneme)
+		// beklenir ve yanıt OKUNUR.
+		var sent bool
+		for attempt := 1; attempt <= 4 && !sent; attempt++ {
+			time.Sleep(1500 * time.Millisecond)
+			if getCodeActive(b) {
+				_ = clickGetCode(b)
+			} else {
+				// Buton pasifse (geri sayım) kod isteği zaten gitmiştir.
+				if resp := smsResponse(b); resp != "" {
+					sent = true
+					logf("   gitcode: CAPTCHA sonrası yanıt (deneme %d): %s", attempt, truncateOne(resp, 250))
+					if strings.Contains(resp, "400018") || strings.Contains(resp, "YUNPIAN") {
+						return fmt.Errorf("CAPTCHA geçildi ama kod isteği yine reddedildi: %s", truncateOne(resp, 200))
+					}
+				}
+				continue
+			}
+			time.Sleep(2 * time.Second)
+			if resp := smsResponse(b); resp != "" {
+				sent = true
+				logf("   gitcode: CAPTCHA sonrası yanıt (deneme %d): %s", attempt, truncateOne(resp, 250))
+				if strings.Contains(resp, "400018") || strings.Contains(resp, "YUNPIAN") {
+					return fmt.Errorf("CAPTCHA geçildi ama kod isteği yine reddedildi: %s", truncateOne(resp, 200))
+				}
+				if strings.Contains(resp, `"result":true`) {
+					logf("   gitcode: kod isteği sunucuya GİTTİ (result:true)")
+				}
+			}
+		}
+		if !sent {
+			logf("   gitcode: UYARI — CAPTCHA sonrası kod isteği yanıtı yakalanamadı")
 		}
 	}
 
@@ -687,6 +753,30 @@ func (s *GitCode) gitcodeRegister(ctx context.Context, b *kahin.Browser, acc acc
 	// gövdeyle kanıtlanır.
 	if err := installReqHook(b); err != nil {
 		logf("   gitcode: istek kancası kurulamadı: %v", err)
+	}
+
+	// GÖNDERİM ÖNCESİ teşhis: "Please read and agree" metni sayfada ZATEN
+	// var mı (gizli doğrulama mesajı → yanlış pozitif riski)? Gönder düğmesi
+	// gerçekten tıklanabilir mi?
+	if pre, err := b.EvalString(`(function(){
+		var t=(document.body?document.body.innerText:'');
+		var has=t.indexOf('Please read and agree')>=0;
+		var btn=null;
+		var all=Array.from(document.querySelectorAll('button,a,div,span'));
+		for(var i=0;i<all.length;i++){
+			if((all[i].innerText||'').trim()==='Create account and continue'){btn=all[i];break;}
+		}
+		var br=btn?btn.getBoundingClientRect():null;
+		var st=btn?getComputedStyle(btn):null;
+		return JSON.stringify({preHasError:has,
+			btnTag:btn?btn.tagName:null,btnCls:btn?String(btn.className):null,
+			btnRect:br?[Math.round(br.left),Math.round(br.top),Math.round(br.width),Math.round(br.height)]:null,
+			btnPE:st?st.pointerEvents:null,
+			boxes:Array.from(document.querySelectorAll('input[type=checkbox]')).map(function(c){
+				var lab=c.closest('label');var root=lab?lab.closest('.devui-checkbox'):null;
+				return {native:c.checked,root:root?root.className:'-'};})});
+	})()`); err == nil {
+		logf("   gitcode: gönderim öncesi teşhis: %s", truncateOne(pre, 900))
 	}
 
 	// Gönder.

@@ -27,63 +27,130 @@ import (
 // ---------------------------------------------------------------------------
 
 // Sms24, sms24.me sağlayıcısıdır.
+//
+// ÇOK ÜLKELİ: hedef formun kabul ettiği tüm ülkelerden numara toplar.
+// CANLI KANIT: gitcode SMS'i şu sms24 numaralarına düştü —
+// +487911637751 (Polonya), +46729427296 (İsveç), +447576123381 (UK),
+// +66660041301 (Tayland), +3584573998041 (Finlandiya), +85256942757 (HK).
+// Bu yüzden yalnız +86 değil, formun kabul ettiği ülkelerin TAMAMI taranır.
 type Sms24 struct {
 	Client *http.Client
-	// Browser, mesaj okuma köprüsüdür. Sayfa mesajları "Show SMS messages"
-	// tıklamasından sonra yüklediği için (canlı kanıt: tıklama öncesi HTML'de
-	// mesaj yok, sonrasında DOM'da 5 mesaj) okuma tarayıcı bağlamında yapılır.
+	// Countries, taranacak sms24 ülke kodları (ör. "pl","se","fi","gb").
+	// Boşsa varsayılan liste kullanılır.
+	Countries []string
+	// Browser, mesaj okuma köprüsüdür (mesajlar yalnız tarayıcı bağlamında
+	// görünür — canlı kanıt: "Show SMS messages" sonrası DOM'a geliyor).
 	Browser Sms24Browser
 }
 
 // Sms24Browser, tarayıcı bağlamında sms24 mesajlarını okuma yeteneğidir.
-//
-// Dönen metin, sayfadaki "From: X ... <mesaj>" bloklarının düz metnidir.
 type Sms24Browser interface {
-	// OpenAndReadMessages, numara sayfasını açar, "Show SMS messages"
-	// düğmesine basar ve mesaj metnini döndürür.
 	OpenAndReadMessages(ctx context.Context, full string) (string, error)
 }
 
 func (p *Sms24) Name() string { return "sms24" }
 
-var (
-	reS24Num = regexp.MustCompile(`/en/numbers/(86[0-9]{9,11})`)
-	reS24Msg = regexp.MustCompile(`(?is)From:\s*([^<]{1,40})</[^>]+>\s*(?:<[^>]+>\s*)*([^<]{5,300})`)
-	reS24Any = regexp.MustCompile(`(?is)(?:verification code|code is|验证码|校验码)[^<]{0,60}`)
-)
+// sms24 ülke kodu → E.164 ülke kodu eşlemesi.
+//
+// CANLI DOĞRULANAN: sms24 URL'leri ISO-3166 alpha-2 kullanır
+// (https://sms24.me/en/countries/fi). gitcode formunun ülke kodlarıyla
+// eşleştirilir.
+var sms24Countries = map[string]string{
+	"cn": "86", "hk": "852", "tw": "886", "us": "1", "ru": "7",
+	"fr": "33", "pt": "351", "ie": "353", "fi": "358", "it": "39",
+	"ch": "41", "gb": "44", "se": "46", "no": "47", "pl": "48",
+	"de": "49", "ar": "54", "my": "60", "sg": "65", "th": "66",
+	"tr": "90", "in": "91", "pk": "92", "il": "972",
+}
 
-// Numbers, sms24.me'den +86 numaraları toplar.
+// sms24DefaultCountries, hiç ülke verilmediğinde taranan ülkelerdir.
+// Formun kabul ettiği ve gitcode SMS'inin düştüğü KANITLANMIŞ ülkeler önce.
+// sms24Len, ülke koduna göre BEKLENEN toplam numara uzunluğudur
+// (ülke kodu + yerel numara). Canlı ölçümle doğrulanmıştır; sms24 bazı
+// sayfalarda dahili ID'leri numara gibi listeler (ör. HK'de 14 haneli).
+var sms24Len = map[string]int{
+	"86":  13, // 86 + 11
+	"852": 11, // 852 + 8
+	"886": 12, // 886 + 9
+	"1":   11, // 1 + 10
+	"7":   11, // 7 + 10
+	"33":  11, // 33 + 9
+	"44":  12, // 44 + 10
+	"46":  11, // 46 + 9
+	"48":  11, // 48 + 9
+	"49":  12, // 49 + 11
+	"358": 12, // 358 + 9
+	"66":  11, // 66 + 9
+	"90":  12, // 90 + 10
+}
+
+var sms24DefaultCountries = []string{
+	"fi", "pl", "se", "gb", "th", "hk", // gitcode SMS'i düşen ülkeler (kanıtlı)
+	"cn", "de", "fr", "it", "us",
+}
+
+// Numbers, sms24.me'den (çok ülkeli) numaraları toplar.
 func (p *Sms24) Numbers(ctx context.Context) ([]Number, error) {
-	body, code, err := Get(ctx, p.Client, "https://sms24.me/en/countries/cn")
+	countries := p.Countries
+	if len(countries) == 0 {
+		countries = sms24DefaultCountries
+	}
+	var out []Number
+	var errs []string
+	for _, iso := range countries {
+		cc, ok := sms24Countries[iso]
+		if !ok {
+			continue
+		}
+		nums, err := p.numbersFor(ctx, iso, cc)
+		if err != nil {
+			errs = append(errs, iso+": "+err.Error())
+			continue
+		}
+		out = append(out, nums...)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("sms24: hiç numara yok (%s)", strings.Join(errs, "; "))
+	}
+	return out, nil
+}
+
+// numbersFor, tek bir ülkenin numaralarını toplar.
+func (p *Sms24) numbersFor(ctx context.Context, iso, cc string) ([]Number, error) {
+	body, code, err := Get(ctx, p.Client, "https://sms24.me/en/countries/"+iso)
 	if err != nil {
-		return nil, fmt.Errorf("sms24: %w", err)
+		return nil, err
 	}
 	if code != http.StatusOK {
-		return nil, fmt.Errorf("sms24: HTTP %d", code)
+		return nil, fmt.Errorf("HTTP %d", code)
 	}
 	var out []Number
 	seen := map[string]bool{}
 	for _, m := range reS24Num.FindAllStringSubmatch(body, -1) {
-		full := m[1] // 8613231012150
+		full := m[1] // ülke koduna göre tam numara
 		if seen[full] {
 			continue
 		}
 		seen[full] = true
-		local := strings.TrimPrefix(full, "86")
-		// gitcode yalnız 11 haneli Çin numarası kabul eder.
-		if len(local) != 11 {
+		local := strings.TrimPrefix(full, cc)
+		if local == "" || local == full {
+			continue
+		}
+		// UZUNLUK DOĞRULAMASI (canlı kanıt): sms24 bazı sayfalarda gerçek
+		// numara yerine dahili ID gösterir. Örnek: HK sayfasında
+		// "85215976969802" (14 hane) — bu numara DEĞİL. Gerçek HK numarası
+		// +852 + 8 hane = 11 hanedir. Bu yüzden ülke bazlı beklenen toplam
+		// uzunluk kontrol edilir; uymayan kayıtlar atlanır.
+		if want := sms24Len[cc]; want > 0 && len(full) != want {
 			continue
 		}
 		out = append(out, Number{
-			CC:      "86",
+			CC:      cc,
 			Local:   local,
 			E164:    "+" + full,
-			Country: "cn",
+			Country: iso,
 			Source:  "sms24",
 		})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("sms24: +86 numara yok")
 	}
 	return out, nil
 }
@@ -124,6 +191,13 @@ func (p *Sms24) Messages(ctx context.Context, n Number) ([]Message, error) {
 // reS24Block, DOM düz metnindeki "From: X\n<zaman>\n\n<mesaj>" bloklarını
 // yakalar (canlı doğrulandı).
 var reS24Block = regexp.MustCompile(`(?is)From:\s*([^\n]{1,40})\s*\n[^\n]*\n\s*\n?\s*([^\n]{5,300})`)
+
+// reS24Num, sms24 numara bağlantılarını yakalar (ülke kodu öneki serbest:
+// cn için 86..., fi için 358..., pl için 48...).
+var reS24Num = regexp.MustCompile(`/en/numbers/([0-9]{8,15})`)
+
+// reS24Any, serbest metinde kod ipucu arayan yedek desendir.
+var reS24Any = regexp.MustCompile(`(?is)(?:verification code|code is|验证码|校验码)[^<]{0,60}`)
 
 func cleanS24(s string) string {
 	s = reTagStrip.ReplaceAllString(s, " ")

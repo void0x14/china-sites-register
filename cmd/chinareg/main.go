@@ -467,12 +467,23 @@ func cmdRun(args []string) error {
 	// canlı kanıt: "Show SMS messages" tıklamasından sonra DOM'a geliyor).
 	poolFactory := func(worker int, b *kahin.Browser) *sms.Pool {
 		bridge := flow.NewBrowserSMSBridge(b)
+		// SIRA: sms24 ÖNCE. Gerekçe (canlı kanıt): gitcode SMS'i sms24
+		// numaralarına GERÇEKTEN düşüyor — /en/messages/gitcode sayfası
+		// +487911637751 (Polonya), +46729427296 (İsveç), +447576123381 (UK),
+		// +66660041301 (Tayland), +3584573998041 (Finlandiya),
+		// +85256942757 (HK) numaralarına gelen kodları listeliyor. Ayrıca
+		// gitcode formu bu ülkelerin TAMAMINI kabul ediyor (24 ülke).
+		// free-sms-receive +86 numaraları CSDN kara listesinde → teslim yok.
 		return sms.NewPool(
-			&sms.Sms24{Client: sms.NewHTTPClient(), Browser: bridge},
-			&sms.FreeSMSReceive{Client: sms.NewHTTPClient()},
+			&sms.Sms24{
+				Client:    sms.NewHTTPClient(),
+				Browser:   bridge,
+				Countries: []string{"fi", "pl", "se", "gb", "th", "hk", "de", "fr", "it"},
+			},
 			&sms.Quackr{Client: sms.NewHTTPClient(), Browser: bridge},
-			&sms.FreePhoneNum{Client: sms.NewHTTPClient(), Countries: []string{"us", "gb", "ca", "pl", "se"}},
-			&sms.ReceiveSMSFreeCC{Client: sms.NewHTTPClient(), CountrySlugs: []string{"USA", "UK", "Sweden", "Finland"}},
+			&sms.FreePhoneNum{Client: sms.NewHTTPClient(), Countries: []string{"fi", "pl", "se", "gb", "th", "hk", "de", "fr", "it"}},
+			&sms.ReceiveSMSFreeCC{Client: sms.NewHTTPClient(), CountrySlugs: []string{"Finland", "UK", "Sweden"}},
+			&sms.FreeSMSReceive{Client: sms.NewHTTPClient()},
 		)
 	}
 

@@ -257,6 +257,8 @@ type yidunAnswer struct {
 	Points [][2]float64 `json:"points"`
 	// Pairs, takas edilecek karo çiftleri (karo indeksleri, 0 tabanlı satır-major).
 	Pairs [][2]int `json:"pairs"`
+	// Path, "top sürükle" türü için yol noktalarıdır (görselin kendi uzayı).
+	Path [][2]float64 `json:"path"`
 	// NatW/NatH, Grok'un kullandığı görsel uzayı (kırpılan görselin boyutu).
 	NatW float64 `json:"-"`
 	NatH float64 `json:"-"`
@@ -265,6 +267,7 @@ type yidunAnswer struct {
 var (
 	reYidunPoints = regexp.MustCompile(`"points"\s*:\s*(\[[^\]]*(?:\][^\]]*)*?\]\s*\])`)
 	reYidunPairs  = regexp.MustCompile(`"pairs"\s*:\s*(\[[^\]]*(?:\][^\]]*)*?\]\s*\])`)
+	reYidunPath   = regexp.MustCompile(`"path"\s*:\s*(\[[^\]]*(?:\][^\]]*)*?\]\s*\])`)
 )
 
 // askYidun, Grok CLI'ya Yidun görselini verip çözümü ister.
@@ -279,6 +282,13 @@ func askYidun(ctx context.Context, solver *captcha.Solver, imgPath, kind string,
 	}
 	var instr string
 	switch {
+	case strings.Contains(kind, "drag") || strings.Contains(kind, "ball") || strings.Contains(kind, "obstacle"):
+		// CANLI KANIT: "drag the lower left white ball to avoid obstacles and
+		// hit ..." — top sol alttan baslar, engellerden kacarak hedefe gider.
+		instr = fmt.Sprintf("NetEase Yidun 'drag the ball' CAPTCHA. The image is the WHOLE CAPTCHA popup (%0.fx%0.f). "+
+			"A white ball starts at the LOWER LEFT. Drag it upward/rightward, AVOIDING the black obstacles, to reach the goal. "+
+			"Give the drag path as waypoints from the ball's start to the goal in the image's OWN pixel space. "+
+			`Output ONLY JSON: {"path":[[x,y],[x,y],...],"start":[x,y],"end":[x,y]}`, nw, nh)
 	case strings.Contains(kind, "click") || strings.Contains(kind, "turn"):
 		instr = fmt.Sprintf("NetEase Yidun 'click in turn' CAPTCHA. The image is the WHOLE CAPTCHA popup: "+
 			"the MAIN PHOTO is at the TOP, and BELOW it there is a strip listing the TARGET icons/characters IN ORDER (left to right). "+
@@ -319,7 +329,10 @@ func parseYidunAnswer(text string) (*yidunAnswer, error) {
 	if m := reYidunPairs.FindStringSubmatch(text); m != nil {
 		_ = json.Unmarshal([]byte(m[1]), &out.Pairs)
 	}
-	if len(out.Points) == 0 && len(out.Pairs) == 0 {
+	if m := reYidunPath.FindStringSubmatch(text); m != nil {
+		_ = json.Unmarshal([]byte(m[1]), &out.Path)
+	}
+	if len(out.Points) == 0 && len(out.Pairs) == 0 && len(out.Path) == 0 {
 		return nil, fmt.Errorf("yidun: çözüm ayrıştırılamadı: %s", truncateOne(text, 200))
 	}
 	return out, nil
@@ -339,6 +352,36 @@ func applyYidun(b *kahin.Browser, kind string, ans *yidunAnswer, geo *yidunGeo) 
 		sx, sy = 1, 1
 	}
 	switch {
+	case len(ans.Path) > 0:
+		// "top sürükle": yol noktalarını sırayla gerçek fare hareketiyle gez.
+		// İlk nokta topun başlangıcıdır → mouse_down orada; son nokta hedef
+		// → mouse_up. Ara noktalar MouseMove ile.
+		first := ans.Path[0]
+		sx0 := geo.X + first[0]*sx
+		sy0 := geo.Y + first[1]*sy
+		if err := b.MouseMove(sx0, sy0); err != nil {
+			return err
+		}
+		time.Sleep(120 * time.Millisecond)
+		if err := b.MouseDown(sx0, sy0, 0); err != nil {
+			return err
+		}
+		time.Sleep(80 * time.Millisecond)
+		for _, p := range ans.Path[1:] {
+			px := geo.X + p[0]*sx
+			py := geo.Y + p[1]*sy
+			if err := b.MouseMove(px, py); err != nil {
+				return err
+			}
+			time.Sleep(60 * time.Millisecond)
+		}
+		last := ans.Path[len(ans.Path)-1]
+		ex := geo.X + last[0]*sx
+		ey := geo.Y + last[1]*sy
+		time.Sleep(100 * time.Millisecond)
+		if err := b.MouseUp(ex, ey, 0); err != nil {
+			return err
+		}
 	case len(ans.Pairs) > 0:
 		// 2x2 karo takası: her karonun merkezine tıkla (ana görsel alanında).
 		for _, p := range ans.Pairs {
