@@ -117,12 +117,19 @@ func SolveYidun(ctx context.Context, b *kahin.Browser, solver *captcha.Solver, p
 	return lastErr
 }
 
-// yidunGeo, Yidun görsel alanının ekran yerleşimidir (CSS px) ve kırpılan
+// yidunGeo, Yidun kırpımının ekran yerleşimidir (CSS px) ve kırpılan
 // görselin piksel boyutudur (Grok bu uzayda koordinat verir).
+//
+// Kırpım POPUP'IN TAMAMIDIR (.yidun_modal__body); ana görsel onun içinde
+// belirli bir konumdadır. Grok'un verdiği koordinat önce kırpım uzayından
+// CSS px'e, sonra ekrana çevrilir.
 type yidunGeo struct {
-	X, Y, W, H float64 // img.yidun_bg-img ekran dikdörtgeni (CSS px)
+	X, Y, W, H float64 // kırpımın ekran dikdörtgeni (CSS px)
 	CropW      float64 // kırpılan görselin piksel genişliği
 	CropH      float64 // kırpılan görselin piksel yüksekliği
+	// ImgX, ImgY, ImgW, ImgH: ana bulmaca görselinin (img.yidun_bg-img)
+	// EKRAN dikdörtgeni. Tıklamalar bu alana düşmelidir.
+	ImgX, ImgY, ImgW, ImgH float64
 }
 
 // cropYidunImage, Yidun bulmaca görselini ekran görüntüsünden kırpıp diske yazar.
@@ -199,22 +206,27 @@ func cropYidunImage(b *kahin.Browser, round int) (string, *yidunGeo, error) {
 	return p, &geo, nil
 }
 
-// readYidunGeo, Yidun bulmaca görselinin ekran geometrisini okur.
+// readYidunGeo, Yidun bulmaca alanının ekran geometrisini okur.
 //
-// Öncelik: img.yidun_bg-img (görselin kendisi). Bulunamazsa panel
-// (.yidun_bgimg) kullanılır. Görselin alt şeritteki hedef ikonları da
-// kapsaması için yükseklik .yidun_bg-img'ten alınır (300 CSS px, gerçek
-// görsel 480x360).
+// CANLI DOĞRULANAN: Yidun hedef ikonları/karakterleri BAZEN ana görselin alt
+// şeridinde (.yidun_bg-img içinde, 480x360), BAZEN ayrı bir şeritte
+// (.yidun_tips__img, 320x240) gösterir. Bu yüzden kırpma bölgesi olarak
+// POPUP'IN TAMAMI (.yidun_modal__body) alınır: hem ana görsel hem hedef
+// şerit hem de "click in turn" metni tek görselde Grok'a gider.
 func readYidunGeo(b *kahin.Browser) (*yidunGeo, error) {
 	out, err := b.EvalString(`(function(){
 		function rect(e){var r=e.getBoundingClientRect();return {x:r.left,y:r.top,w:r.width,h:r.height}};
-		var img=document.querySelector('img.yidun_bg-img');
-		if(img){var r=rect(img); if(r.w>0&&r.h>0)return JSON.stringify(r)}
-		var bg=document.querySelector('.yidun_bgimg');
-		if(bg){var r2=rect(bg); if(r2.w>0&&r2.h>0)return JSON.stringify(r2)}
-		var panel=document.querySelector('.yidun_panel');
-		if(panel){var r3=rect(panel); if(r3.w>0&&r3.h>0)return JSON.stringify(r3)}
-		return 'null';
+		var o={};
+		// Kırpım alanı: modal gövdesi (ana görsel + hedef şerit + metin).
+		var body=document.querySelector('.yidun_modal__body')||document.querySelector('.yidun_panel');
+		if(!body)return 'null';
+		var rb=rect(body); if(rb.w<=0||rb.h<=0)return 'null';
+		o.x=rb.x;o.y=rb.y;o.w=rb.w;o.h=rb.h;
+		// Tıklama alanı: ana bulmaca görseli.
+		var img=document.querySelector('img.yidun_bg-img')||document.querySelector('.yidun_bgimg');
+		if(img){var ri=rect(img);o.imgX=ri.x;o.imgY=ri.y;o.imgW=ri.w;o.imgH=ri.h}
+		else {o.imgX=rb.x;o.imgY=rb.y;o.imgW=rb.w;o.imgH=rb.h}
+		return JSON.stringify(o);
 	})()`)
 	if err != nil {
 		return nil, err
@@ -223,14 +235,20 @@ func readYidunGeo(b *kahin.Browser) (*yidunGeo, error) {
 	if s == "null" || s == "" {
 		return nil, fmt.Errorf("yidun görseli yok")
 	}
-	var geo yidunGeo
-	if err := json.Unmarshal([]byte(s), &geo); err != nil {
+	var raw struct {
+		X, Y, W, H             float64
+		ImgX, ImgY, ImgW, ImgH float64
+	}
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
 		return nil, err
 	}
-	if geo.W <= 0 || geo.H <= 0 {
+	if raw.W <= 0 || raw.H <= 0 {
 		return nil, fmt.Errorf("yidun geometrisi geçersiz")
 	}
-	return &geo, nil
+	return &yidunGeo{
+		X: raw.X, Y: raw.Y, W: raw.W, H: raw.H,
+		ImgX: raw.ImgX, ImgY: raw.ImgY, ImgW: raw.ImgW, ImgH: raw.ImgH,
+	}, nil
 }
 
 // yidunAnswer, Grok'un verdiği çözümdür.
@@ -262,10 +280,10 @@ func askYidun(ctx context.Context, solver *captcha.Solver, imgPath, kind string,
 	var instr string
 	switch {
 	case strings.Contains(kind, "click") || strings.Contains(kind, "turn"):
-		instr = fmt.Sprintf("NetEase Yidun 'click in turn' CAPTCHA. The bottom strip shows the target icons IN ORDER (left to right). "+
-			"Find each icon's matching object in the main photo (the photo occupies the upper part of the image; the icon strip is below it). "+
-			"Give each object's center as (x,y) in the image's OWN %0.fx%0.f pixel space. "+
-			`Output ONLY JSON: {"points":[[x,y],[x,y],...]}`, nw, nh)
+		instr = fmt.Sprintf("NetEase Yidun 'click in turn' CAPTCHA. The image is the WHOLE CAPTCHA popup: "+
+			"the MAIN PHOTO is at the TOP, and BELOW it there is a strip listing the TARGET icons/characters IN ORDER (left to right). "+
+			"Find each target (in that order) inside the MAIN PHOTO and give its center as (x,y) in the image's OWN %0.fx%0.f pixel space. "+
+			`Output ONLY JSON: {"points":[[x,y],[x,y],...]} with exactly as many points as targets, in order.`, nw, nh)
 	case strings.Contains(kind, "swap"):
 		instr = fmt.Sprintf("NetEase Yidun 'swap 2 tiles' CAPTCHA. The main photo is a 2x2 grid of tiles (row-major: 0=top-left,1=top-right,2=bottom-left,3=bottom-right); one tile is blank/misplaced. " +
 			"Give the two tile indices to swap so the image is restored. " +
@@ -308,9 +326,13 @@ func parseYidunAnswer(text string) (*yidunAnswer, error) {
 }
 
 // applyYidun, çözümü gerçek fare olaylarıyla uygular.
+//
+// Grok, kırpımın (popup gövdesi) piksel uzayında koordinat verir. Bunu
+// ekran CSS px'ine çevirip tıklarız:
+//
+//	screenX = geo.X + (point_x / cropW) * geo.W
+//	screenY = geo.Y + (point_y / cropH) * geo.H
 func applyYidun(b *kahin.Browser, kind string, ans *yidunAnswer, geo *yidunGeo) error {
-	// Grok, kırpılan görselin piksel uzayında koordinat verir; ekran CSS px'ine
-	// ölçekle (görsel alanının ekran genişliği / kırpım genişliği).
 	sx := geo.W / ans.NatW
 	sy := geo.H / ans.NatH
 	if ans.NatW <= 0 || ans.NatH <= 0 {
@@ -318,7 +340,7 @@ func applyYidun(b *kahin.Browser, kind string, ans *yidunAnswer, geo *yidunGeo) 
 	}
 	switch {
 	case len(ans.Pairs) > 0:
-		// 2x2 karo takası: her karonun merkezine tıkla.
+		// 2x2 karo takası: her karonun merkezine tıkla (ana görsel alanında).
 		for _, p := range ans.Pairs {
 			for _, idx := range p {
 				if idx < 0 || idx > 3 {
@@ -326,8 +348,8 @@ func applyYidun(b *kahin.Browser, kind string, ans *yidunAnswer, geo *yidunGeo) 
 				}
 				col := float64(idx % 2)
 				row := float64(idx / 2)
-				x := geo.X + (col+0.5)*(geo.W/2)
-				y := geo.Y + (row+0.5)*(geo.H/2)
+				x := geo.ImgX + (col+0.5)*(geo.ImgW/2)
+				y := geo.ImgY + (row+0.5)*(geo.ImgH/2)
 				if err := b.MouseClick(x, y); err != nil {
 					return err
 				}
@@ -338,6 +360,19 @@ func applyYidun(b *kahin.Browser, kind string, ans *yidunAnswer, geo *yidunGeo) 
 		for _, p := range ans.Points {
 			x := geo.X + p[0]*sx
 			y := geo.Y + p[1]*sy
+			// Tıklama ana görsel alanına kırpılır (hedef şeride tıklama sayılmaz).
+			if x < geo.ImgX {
+				x = geo.ImgX
+			}
+			if x > geo.ImgX+geo.ImgW {
+				x = geo.ImgX + geo.ImgW
+			}
+			if y < geo.ImgY {
+				y = geo.ImgY
+			}
+			if y > geo.ImgY+geo.ImgH {
+				y = geo.ImgY + geo.ImgH
+			}
 			if err := b.MouseClick(x, y); err != nil {
 				return err
 			}

@@ -46,28 +46,7 @@ import (
 	"github.com/void0x14/china-sites-register/internal/sms"
 )
 
-// Result, bir kayıt denemesinin sonucudur.
-type Result struct {
-	Site     string
-	Account  accounts.Account
-	Phone    sms.Number
-	Success  bool
-	Stage    string // ulaşılan son aşama
-	Evidence string // son sayfa url/başlık kanıtı
-	Err      error
-}
-
-// Site, hedef platform adaptörüdür.
-type Site interface {
-	Name() string
-	// OAuthLoginURL, "Gitee ile kayıt ol" girişinin başlangıç URL'sidir.
-	OAuthLoginURL() string
-	// SupportedCCs, kayıt formunun kabul ettiği ülke kodlarıdır.
-	// Numara seçimi bu kümeye göre yapılmalıdır; boşsa kısıt yoktur.
-	SupportedCCs() []string
-	// Register, hesap + numara ile kayıt akışını sürer.
-	Register(ctx context.Context, b *kahin.Browser, acc accounts.Account, phone sms.Number, codeFn func(context.Context, sms.Number) (string, error)) (*Result, error)
-}
+// Result ve Site arayüzü site.go içindedir (tüm adaptörler paylaşır).
 
 // ---------------------------------------------------------------------------
 // GitCode (AtomGit)
@@ -80,9 +59,22 @@ type GitCode struct {
 	// Solver, Gitee girişinde çıkan CAPTCHA'yı çözer (Grok CLI).
 	// nil ise CAPTCHA'ya girilmez ve hata döner.
 	Solver *captcha.Solver
+	// Host, site kök adresi (varsayılan https://gitcode.com).
+	//
+	// GitLink (gitlink.org.cn) aynı AtomGit altyapısını ve aynı Gitee OAuth
+	// akışını kullandığı için bu alan üzerinden yeniden kullanılır.
+	Host string
 }
 
 func (s *GitCode) Name() string { return "gitcode" }
+
+// baseURL, site kök adresini döndürür.
+func (s *GitCode) baseURL() string {
+	if s.Host != "" {
+		return strings.TrimRight(s.Host, "/")
+	}
+	return "https://gitcode.com"
+}
 
 // SupportedCCs, gitcode kayıt formunun ülke kodu seçicisinde bulunan
 // ülke kodlarıdır (canlı okundu). Numara seçimi bu kümeye göre yapılmalıdır;
@@ -98,7 +90,7 @@ func (s *GitCode) SupportedCCs() []string {
 // OAuthLoginURL, gitcode'un Gitee OAuth başlangıcıdır.
 // Bu uç nokta canlı doğrulandı: 302 → gitee.com/oauth/authorize.
 func (s *GitCode) OAuthLoginURL() string {
-	return "https://gitcode.com/uc/api/v1/oauth/login/gitee"
+	return s.baseURL() + "/uc/api/v1/oauth/login/gitee"
 }
 
 func (s *GitCode) Register(ctx context.Context, b *kahin.Browser, acc accounts.Account, phone sms.Number, codeFn func(context.Context, sms.Number) (string, error)) (*Result, error) {
@@ -271,46 +263,47 @@ var logf = func(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
-// ensureClassicForm, klasik (zh-CN) giriş formunun görünmesini sağlar.
+// ensureClassicForm, klasik (zh-CN) giriş formunun GÖRÜNÜR olmasını sağlar.
 //
-// CANLI DOĞRULANAN MEKANİK: gitee.com/login İngilizce (oversea) açılır;
-// #lang=zh-CN hash'i bazen JS tarafından geç uygulanır. Form gelmezse
-// hash yeniden set edilip hashchange tetiklenir, ardından dil bağlantısı
-// tıklanır.
+// CANLI DOĞRULANAN MEKANİK: gitee.com/login'de İKİ form birden DOM'da
+// bulunur (#new_user klasik + #oversea-login-form). Hangisinin görünür
+// olduğu dil ayarına bağlıdır; İngilizce (oversea) akış yabancı IP'de WAF
+// tarafından sessizce reddedilir. Bu yüzden #user_login'in GÖRÜNÜR olması
+// beklenir; yalnızca DOM'da bulunması yetmez.
+//
+// Sıra: hash uygula → dil bağlantısına gerçek tıkla → doğrudan zh-CN'e git.
 func ensureClassicForm(b *kahin.Browser) error {
-	if waitFor(b, 12*time.Second, func() bool {
-		return evalBool(b, `!!document.querySelector('#user_login')`)
-	}) == nil {
+	vis := func() bool {
+		return evalBool(b, `(function(){
+			var e=document.querySelector('#user_login');
+			if(!e)return false;
+			var r=e.getBoundingClientRect();
+			return r.width>0&&r.height>0;
+		})()`)
+	}
+	if waitFor(b, 12*time.Second, vis) == nil {
 		return nil
 	}
-	// Hash'i yeniden uygula + hashchange tetikle.
-	_, _ = b.EvalString(`(function(){
-		if(location.hash!=='#lang=zh-CN'){location.hash='#lang=zh-CN'}
-		window.dispatchEvent(new HashChangeEvent('hashchange'));
-		return 'ok';
-	})()`)
-	if waitFor(b, 8*time.Second, func() bool {
-		return evalBool(b, `!!document.querySelector('#user_login')`)
-	}) == nil {
+	// 1) Hash'i uygula.
+	_, _ = b.EvalString(`(function(){ if(location.hash!=='#lang=zh-CN'){location.hash='#lang=zh-CN'} return 'ok' })()`)
+	if waitFor(b, 6*time.Second, vis) == nil {
 		return nil
 	}
-	// Dil bağlantısına gerçek fareyle tıkla.
-	if pos, err := elementCenter(b, `a[href="#lang=zh-CN"]`); err == nil {
-		_ = b.MouseClick(pos[0], pos[1])
+	// 2) Dil bağlantısına gerçek fareyle tıkla (birden çok eşleşme olabilir).
+	for attempt := 0; attempt < 2; attempt++ {
+		if pos, err := elementCenter(b, `a[href="#lang=zh-CN"]`); err == nil {
+			_ = b.MouseClick(pos[0], pos[1])
+		}
+		if waitFor(b, 8*time.Second, vis) == nil {
+			return nil
+		}
 	}
-	if waitFor(b, 15*time.Second, func() bool {
-		return evalBool(b, `!!document.querySelector('#user_login')`)
-	}) == nil {
-		return nil
-	}
-	// Son çare: zh-CN'e doğrudan git.
+	// 3) Doğrudan zh-CN URL'sine git.
 	if err := b.Navigate("https://gitee.com/login#lang=zh-CN", "domcontentloaded", 45*time.Second); err != nil {
 		return fmt.Errorf("zh-CN giriş sayfası: %w", err)
 	}
-	if waitFor(b, 15*time.Second, func() bool {
-		return evalBool(b, `!!document.querySelector('#user_login')`)
-	}) != nil {
-		return fmt.Errorf("gitee klasik giriş formu gelmedi")
+	if waitFor(b, 15*time.Second, vis) != nil {
+		return fmt.Errorf("gitee klasik giriş formu görünür olmadı (url: %s)", rURL(b))
 	}
 	return nil
 }
@@ -516,8 +509,9 @@ func (s *GitCode) GiteeAuthorize(ctx context.Context, b *kahin.Browser) error {
 			}
 		}
 		// Callback'e döndüyse bitti.
-		if strings.Contains(info.URL, "gitcode.com/oauth/callback") ||
-			strings.Contains(info.URL, "gitcode.com") {
+		host := strings.TrimPrefix(strings.TrimPrefix(s.baseURL(), "https://"), "http://")
+		if strings.Contains(info.URL, host+"/oauth/callback") ||
+			strings.Contains(info.URL, host) {
 			return nil
 		}
 		time.Sleep(1 * time.Second)

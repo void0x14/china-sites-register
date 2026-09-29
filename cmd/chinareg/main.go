@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -200,7 +202,7 @@ func cmdAccounts(args []string) error {
 // ---------------------------------------------------------------------------
 
 func cmdSites(args []string) error {
-	for _, s := range allSites() {
+	for _, s := range sites.All() {
 		fmt.Printf("%-10s  oauth=%s\n", s.Name(), s.OAuthLoginURL())
 		fmt.Printf("           desteklenen ülke kodları: %s\n", strings.Join(s.SupportedCCs(), ","))
 	}
@@ -371,22 +373,31 @@ func cmdOAuth(args []string) error {
 
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	siteName := fs.String("site", "gitcode", "hedef site")
-	limit := fs.Int("limit", 1, "kaç hesap denenecek")
-	all := fs.Bool("all", false, "tüm hesaplarla sırayla dene")
+	siteName := fs.String("site", "all", "hedef site: all | gitcode | gitlink | jihulab")
+	limit := fs.Int("limit", 1, "site başına kaç hesap denenecek")
+	all := fs.Bool("all", false, "tüm hesaplarla dene")
 	cc := fs.String("cc", "", "tercih edilen ülke kodu (ör. 86)")
 	codeTimeout := fs.Duration("code-timeout", 5*time.Minute, "SMS kodu bekleme süresi")
 	phoneAttempts := fs.Int("phone-attempts", 3, "hesap başına denenecek farklı numara sayısı")
 	from := fs.Int("from", 0, "başlanacak hesap indeksi (0 tabanlı)")
+	workers := fs.Int("workers", 4, "eşzamanlı tarayıcı/işçi sayısı")
 	_ = fs.Parse(args)
 
 	ctx, cancel := signalCtx()
 	defer cancel()
 
-	site, err := siteByName(*siteName)
-	if err != nil {
-		return err
+	// Site seçimi: "all" → tüm siteler eşzamanlı.
+	var chosen []sites.Site
+	if strings.EqualFold(*siteName, "all") || *siteName == "" {
+		chosen = sites.All()
+	} else {
+		s, err := siteByName(*siteName)
+		if err != nil {
+			return err
+		}
+		chosen = []sites.Site{s}
 	}
+
 	accs, err := loadAccounts()
 	if err != nil {
 		return err
@@ -402,45 +413,60 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	c, err := kahin.NewClient(cfg.Options())
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	ts, err := flow.CheckKahinTools(c)
-	if err != nil {
-		return err
-	}
-	if len(ts.Missing) > 0 {
-		return fmt.Errorf("kahin tool eksik: %s", strings.Join(ts.Missing, ", "))
-	}
-	b, _, err := flow.StartBrowser(c, cfg)
-	if err != nil {
-		return err
+
+	// Her işçi KENDİ Kahin sürecini ve KENDİ tarayıcı slotunu kullanır:
+	// ayrı KAHIN_BROWSER_LOCK_PATH + KAHIN_HOME verilmezse makine geneli tek
+	// slot çakışır (engine_process_conflict). Bu yüzden işçi başına ayrı
+	// kilit/profil yolu üretilir.
+	browserFactory := func(worker int) (*kahin.Browser, func(), error) {
+		wcfg := cfg
+		base := os.TempDir()
+		wcfg.Lock = filepath.Join(base, fmt.Sprintf("kahin-worker-%d/browser.lock", worker))
+		wcfg.Home = filepath.Join(base, fmt.Sprintf("kahin-worker-%d/home", worker))
+		wcfg.Profile = filepath.Join(base, fmt.Sprintf("kahin-worker-%d/profile", worker))
+		if err := os.MkdirAll(filepath.Dir(wcfg.Lock), 0o755); err != nil {
+			return nil, nil, err
+		}
+		if err := os.MkdirAll(wcfg.Home, 0o755); err != nil {
+			return nil, nil, err
+		}
+		c, err := kahin.NewClient(wcfg.Options())
+		if err != nil {
+			return nil, nil, fmt.Errorf("işçi %d kahin istemcisi: %w", worker, err)
+		}
+		ts, err := flow.CheckKahinTools(c)
+		if err != nil {
+			c.Close()
+			return nil, nil, err
+		}
+		if len(ts.Missing) > 0 {
+			c.Close()
+			return nil, nil, fmt.Errorf("işçi %d kahin tool eksik: %s", worker, strings.Join(ts.Missing, ", "))
+		}
+		b, _, err := flow.StartBrowser(c, wcfg)
+		if err != nil {
+			c.Close()
+			return nil, nil, fmt.Errorf("işçi %d tarayıcı: %w", worker, err)
+		}
+		return b, func() { c.Close() }, nil
 	}
 
-	solver := captcha.Default()
+	solverFactory := func(worker int) *captcha.Solver { return captcha.Default() }
 	pool := defaultPool()
 
-	// CAPTCHA çözücüyü adaptöre bağla (Gitee girişinde çıkarsa Grok CLI çözer).
-	if gc, ok := site.(*sites.GitCode); ok {
-		gc.Solver = solver
-	}
-
-	// Numara, hedef formun kabul ettiği ülke kodlarından seçilir.
-	allowed := site.SupportedCCs()
-
 	rep := flow.Run(ctx, flow.Options{
-		Accounts:         accs,
-		Site:             site,
-		Pool:             pool,
-		Browser:          b,
-		Solver:           solver,
-		PreferredCC:      *cc,
-		AllowedCCs:       allowed,
-		CodeTimeout:      *codeTimeout,
-		MaxPhoneAttempts: *phoneAttempts,
-		Log:              func(s string) { fmt.Println(s) },
+		Accounts:           accs,
+		Sites:              chosen,
+		Pool:               pool,
+		BrowserFactory:     browserFactory,
+		SolverFactory:      solverFactory,
+		PreferredCC:        *cc,
+		AllowedCCs:         allSupportedCCs(chosen),
+		CodeTimeout:        *codeTimeout,
+		Workers:            *workers,
+		MaxPhoneAttempts:   *phoneAttempts,
+		MaxAccountsPerSite: pickLimit(*all, *limit),
+		Log:                func(s string) { fmt.Println(s) },
 	})
 
 	fmt.Printf("\n== özet: %d/%d başarılı (%s) ==\n",
@@ -450,7 +476,7 @@ func cmdRun(args []string) error {
 		if r.Success {
 			status = "✓"
 		}
-		fmt.Printf("  %-10s %-6s %s\n", r.Account.Username, status, r.Phone.E164)
+		fmt.Printf("  %-10s %-10s %-6s %s\n", r.Site, r.Account.Username, status, r.Phone.E164)
 	}
 	if rep.OK() == 0 {
 		return fmt.Errorf("hiç kayıt başarılı olmadı")
@@ -458,21 +484,53 @@ func cmdRun(args []string) error {
 	return nil
 }
 
+// allSupportedCCs, seçilen sitelerin kabul ettiği ülke kodlarının kesişimidir.
+//
+// Birden çok site paralel deneneceğinde, bir numaranın TÜM sitelerde
+// kullanılabilmesi için kesişim alınır.
+func allSupportedCCs(ss []sites.Site) []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	inter := map[string]bool{}
+	for _, cc := range ss[0].SupportedCCs() {
+		inter[cc] = true
+	}
+	for _, s := range ss[1:] {
+		next := map[string]bool{}
+		for _, cc := range s.SupportedCCs() {
+			if inter[cc] {
+				next[cc] = true
+			}
+		}
+		inter = next
+	}
+	var out []string
+	for cc := range inter {
+		out = append(out, cc)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func pickLimit(all bool, limit int) int {
+	if all {
+		return 0
+	}
+	return limit
+}
+
 // ---------------------------------------------------------------------------
 // ortak
 // ---------------------------------------------------------------------------
 
-func allSites() []sites.Site {
-	return []sites.Site{&sites.GitCode{}}
-}
-
 func siteByName(name string) (sites.Site, error) {
-	for _, s := range allSites() {
+	for _, s := range sites.All() {
 		if strings.EqualFold(s.Name(), name) {
 			return s, nil
 		}
 	}
-	return nil, fmt.Errorf("bilinmeyen site: %s (mevcut: gitcode)", name)
+	return nil, fmt.Errorf("bilinmeyen site: %s (mevcut: %s)", name, strings.Join(sites.Names(), ", "))
 }
 
 // defaultPool, canlı doğrulanmış iki sağlayıcıyla havuz kurar.

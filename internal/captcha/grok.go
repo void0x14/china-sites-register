@@ -141,6 +141,11 @@ func (s *Solver) Solve(ctx context.Context, req Request) (*Answer, error) {
 		"--output-format", "json",
 		"--permission-mode", "bypassPermissions",
 		"--always-approve",
+		// HIZ (canlı ölçüldü): subagent açma ve gereksiz tool'ları kapatınca
+		// tek görsel okuma 8 sn'de döner. Bunlar olmadan aynı iş 5-10 dakika
+		// sürüyor (Grok kendi kendine plan/subagent başlatıyor).
+		"--no-subagents",
+		"--tools", "Read",
 	}
 	args = append(args, s.ExtraArgs...)
 
